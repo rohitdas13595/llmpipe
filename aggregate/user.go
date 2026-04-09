@@ -2,12 +2,12 @@ package aggregate
 
 import (
 	"context"
-	"log"
 	"strings"
 
 	"github.com/rohitdas13595/llmpipe/audio/interrupt"
 	"github.com/rohitdas13595/llmpipe/frames"
 	"github.com/rohitdas13595/llmpipe/processor"
+	"github.com/rohitdas13595/llmpipe/services"
 )
 
 // UserAggregator appends transcriptions and triggers LLM runs.
@@ -43,7 +43,7 @@ func (u *UserAggregator) Process(ctx context.Context, f frames.Frame, dir proces
 			emit.Down(&frames.InterruptionFrame{})
 		}
 		u.ctx.AppendUser(fr.Text)
-		log.Printf("%s: transcript OK → LLM run (%q)", u.name, strings.TrimSpace(fr.Text))
+		services.PipelineLog("pipeline", "%s: transcript OK → LLM run (%q)", u.name, strings.TrimSpace(fr.Text))
 		emit.Down(&frames.LLMRunFrame{})
 	default:
 		emit.Down(f)

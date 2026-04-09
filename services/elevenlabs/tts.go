@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
 	"strings"
 	"sync"
@@ -12,6 +11,7 @@ import (
 	"github.com/rohitdas13595/llmpipe/aggregate"
 	"github.com/rohitdas13595/llmpipe/frames"
 	"github.com/rohitdas13595/llmpipe/processor"
+	"github.com/rohitdas13595/llmpipe/services"
 )
 
 // TTS calls ElevenLabs REST API with PCM output.
@@ -89,26 +89,31 @@ func (t *TTS) flushBufferedText(ctx context.Context, emit processor.Emit) {
 		return
 	}
 	if t.APIKey == "" {
-		log.Println("elevenlabs: ELEVENLABS_API_KEY is empty")
+		services.PipelineLog("tts", "elevenlabs: ELEVENLABS_API_KEY is empty")
 		emit.Down(&frames.ErrorFrame{Err: fmt.Errorf("elevenlabs: missing API key")})
 		return
 	}
 	if strings.TrimSpace(t.VoiceID) == "" {
-		log.Println("elevenlabs: ELEVENLABS_VOICE_ID is empty")
+		services.PipelineLog("tts", "elevenlabs: ELEVENLABS_VOICE_ID is empty")
 		emit.Down(&frames.ErrorFrame{Err: fmt.Errorf("elevenlabs: missing voice id")})
 		return
 	}
+	preview := text
+	if len(preview) > 120 {
+		preview = preview[:120] + "…"
+	}
+	services.PipelineLog("tts", "elevenlabs: synthesizing %d chars, preview: %q", len(text), preview)
 	pcm, err := t.synth(ctx, text)
 	if err != nil {
-		log.Println("elevenlabs:", err)
+		services.PipelineLog("tts", "elevenlabs: %v", err)
 		emit.Down(&frames.ErrorFrame{Err: err})
 		return
 	}
 	if len(pcm) == 0 {
-		log.Println("elevenlabs: empty PCM response")
+		services.PipelineLog("tts", "elevenlabs: empty PCM response")
 		return
 	}
-	log.Printf("elevenlabs: synthesized %d bytes PCM (%d Hz) for %d chars", len(pcm), t.SampleRate, len(text))
+	services.PipelineLog("tts", "elevenlabs: synthesized %d bytes PCM (%d Hz) for %d chars", len(pcm), t.SampleRate, len(text))
 	if t.Bot != nil {
 		t.Bot.SetSpeaking(true)
 	}

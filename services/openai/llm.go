@@ -7,8 +7,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 
@@ -68,7 +68,7 @@ func (l *LLM) Process(ctx context.Context, f frames.Frame, dir processor.Directi
 			emit.Down(&frames.ErrorFrame{Err: fmt.Errorf("openai: Reenter not configured")})
 			return nil
 		}
-		log.Printf("%s: LLMRunFrame → starting chat completion", l.name)
+		services.PipelineLog("llm", "%s: LLMRunFrame → starting chat completion", l.name)
 		go l.runCompletion(context.Background())
 	case *frames.ErrorFrame:
 		emit.Down(f)
@@ -114,12 +114,12 @@ func (l *LLM) runCompletion(bg context.Context) {
 	}()
 
 	msgs := l.Ctx.Snapshot()
-	log.Printf("%s: POST /v1/chat/completions model=%q messages=%d", l.name, l.Model, len(msgs))
+	services.PipelineLog("llm", "%s: POST /v1/chat/completions model=%q messages=%d", l.name, l.Model, len(msgs))
 	body, _ := json.Marshal(chatReq{Model: l.Model, Messages: msgs, Stream: true})
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
 		"https://api.openai.com/v1/chat/completions", bytes.NewReader(body))
 	if err != nil {
-		log.Printf("%s: request error: %v", l.name, err)
+		services.PipelineLog("llm", "%s: request error: %v", l.name, err)
 		_ = l.Reenter(ctx, l.name, &frames.ErrorFrame{Err: err})
 		return
 	}
@@ -128,14 +128,14 @@ func (l *LLM) runCompletion(bg context.Context) {
 
 	resp, err := l.httpClient.Do(req)
 	if err != nil {
-		log.Printf("%s: HTTP do error: %v", l.name, err)
+		services.PipelineLog("llm", "%s: HTTP do error: %v", l.name, err)
 		_ = l.Reenter(ctx, l.name, &frames.ErrorFrame{Err: err})
 		return
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		b, _ := io.ReadAll(resp.Body)
-		log.Printf("%s: API %s body=%s", l.name, resp.Status, string(b))
+		services.PipelineLog("llm", "%s: API %s body=%s", l.name, resp.Status, string(b))
 		_ = l.Reenter(ctx, l.name, &frames.ErrorFrame{Err: fmt.Errorf("openai: %s: %s", resp.Status, string(b))})
 		return
 	}
@@ -144,7 +144,7 @@ func (l *LLM) runCompletion(bg context.Context) {
 	sc := bufio.NewScanner(resp.Body)
 	for sc.Scan() {
 		if ctx.Err() != nil {
-			log.Printf("%s: stream cancelled (%v)", l.name, ctx.Err())
+			services.PipelineLog("llm", "%s: stream cancelled (%v)", l.name, ctx.Err())
 			_ = l.Reenter(ctx, l.name, &frames.LLMFullResponseEndFrame{})
 			return
 		}
@@ -161,9 +161,12 @@ func (l *LLM) runCompletion(bg context.Context) {
 			continue
 		}
 		if len(ch.Choices) > 0 && ch.Choices[0].Delta.Content != "" {
+			if os.Getenv("LLMPIPE_LOG_LLM_TOKENS") == "1" {
+				services.PipelineLog("llm", "%s: stream token: %q", l.name, ch.Choices[0].Delta.Content)
+			}
 			_ = l.Reenter(ctx, l.name, &frames.LLMTextFrame{Text: ch.Choices[0].Delta.Content})
 		}
 	}
 	_ = l.Reenter(ctx, l.name, &frames.LLMFullResponseEndFrame{})
-	log.Printf("%s: stream finished", l.name)
+	services.PipelineLog("llm", "%s: stream finished", l.name)
 }

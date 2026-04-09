@@ -11,10 +11,10 @@
 </head>
 <body>
   <h1>llmpipe examples</h1>
-  <p>Run the server from the module root:</p>
-  <pre><code>go run ./cmd/voicebot</code></pre>
+  <p>Run the matching server from the module root:</p>
   <ul>
-    <li><a href="voicebot-client.html">Voice bot WebSocket client</a> — microphone → PCM → <code>/ws</code>, plays bot PCM replies.</li>
+    <li><code>go run ./cmd/voicebot</code> → <a href="voicebot-client.html">WebSocket voice client</a> (mic → PCM → <code>/ws</code>).</li>
+    <li><code>go run ./cmd/voicebot-livekit</code> → <a href="livekit-voicebot-client.html">LiveKit voice client</a> (joins room, token from <code>/api/livekit-token</code>; default demo HTTP <code>:8090</code>).</li>
   </ul>
 </body>
 </html>

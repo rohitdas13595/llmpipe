@@ -20,6 +20,8 @@ type Transport struct {
 	mu         sync.RWMutex
 	conn       *websocket.Conn
 	queue      func(context.Context, []frames.Frame) error
+	// OnDisconnect is called when the WebSocket closes (client gone or read error). Use it to stop the pipeline.
+	OnDisconnect func()
 }
 
 // NewTransport creates a WS transport. queue injects frames at pipeline start (typically task.QueueFrames).
@@ -92,6 +94,9 @@ func (t *Transport) HandleWebSocket(w http.ResponseWriter, r *http.Request) erro
 	defer func() {
 		t.setConn(nil)
 		_ = c.Close()
+		if fn := t.OnDisconnect; fn != nil {
+			fn()
+		}
 	}()
 
 	if t.queue != nil {

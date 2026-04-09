@@ -80,9 +80,13 @@ func main() {
 	}
 	vadP := vad.NewProcessor("vad", vad.NewEnergyAnalyzer(vadTh, envIntOr("VAD_MIN_SPEECH", 2), envIntOr("VAD_MIN_SILENCE", 6)))
 
-	userIdle := idle.NewUserProcessor("user.idle", 2*time.Minute, func(retry int) bool {
-		log.Printf("user idle callback retry=%d", retry)
-		return retry < 2
+	userIdle := idle.NewUserProcessor("user.idle", time.Minute, func(retry int) bool {
+		log.Printf("user idle 1m: end pipeline task only (HTTP server keeps running) retry=%d", retry)
+		if task != nil {
+			_ = task.QueueFrames(context.Background(), []frames.Frame{&frames.EndFrame{}})
+			task.Cancel()
+		}
+		return false
 	})
 
 	tr := ws.NewTransport(sampleRate, func(ctx context.Context, ff []frames.Frame) error {
@@ -118,6 +122,14 @@ func main() {
 
 	task = pipeline.NewPipelineTask(p, pipeline.WithIdleObserver(idleObs))
 
+	tr.OnDisconnect = func() {
+		log.Println("websocket closed: queue EndFrame and stop pipeline")
+		if task != nil {
+			_ = task.QueueFrames(context.Background(), []frames.Frame{&frames.EndFrame{}})
+			task.Cancel()
+		}
+	}
+
 	addr := envOr("LISTEN", ":8080")
 	http.Handle("/demo/", http.StripPrefix("/demo/", http.FileServer(http.FS(ex.FS))))
 	http.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
@@ -145,6 +157,8 @@ func main() {
 	if err := runner.Run(rootCtx, task); err != nil && err != context.Canceled {
 		log.Println("runner:", err)
 	}
+	log.Println("pipeline task stopped; HTTP server still listening until SIGINT/SIGTERM")
+	<-rootCtx.Done()
 }
 
 func envOr(k, def string) string {

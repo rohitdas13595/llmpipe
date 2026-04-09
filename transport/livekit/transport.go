@@ -4,13 +4,14 @@ package livekit
 import (
 	"context"
 	"encoding/binary"
+	"log"
 	"sync"
 
 	"github.com/livekit/media-sdk"
+	protoLogger "github.com/livekit/protocol/logger"
 	lksdk "github.com/livekit/server-sdk-go/v2"
 	lkmedia "github.com/livekit/server-sdk-go/v2/pkg/media"
 	"github.com/pion/webrtc/v4"
-	protoLogger "github.com/livekit/protocol/logger"
 
 	"github.com/rohitdas13595/llmpipe/frames"
 	"github.com/rohitdas13595/llmpipe/processor"
@@ -23,34 +24,47 @@ type Transport struct {
 	Info   lksdk.ConnectInfo
 	Logger protoLogger.Logger
 
-	SampleRate int
-	queue      func(context.Context, []frames.Frame) error
+	SampleRate  int
+	queue       func(context.Context, []frames.Frame) error
+	connectOpts []lksdk.ConnectOption
+	// OnDisconnect is called when a remote participant leaves or the room session ends unexpectedly.
+	// Not invoked for disconnects initiated by Transport.Disconnect (intentional agent shutdown).
+	OnDisconnect func()
 
 	mu       sync.RWMutex
 	room     *lksdk.Room
 	localPCM *lkmedia.PCMLocalTrack
 	subOnce  sync.Once
+	intentMu sync.Mutex
+	closing  bool // true while Transport.Disconnect is tearing down the room
 }
 
 // NewTransport builds a LiveKit transport. queue should inject at pipeline start (e.g. task.QueueFrames).
-func NewTransport(url string, info lksdk.ConnectInfo, sampleRate int, queue func(context.Context, []frames.Frame) error, log protoLogger.Logger) *Transport {
+// Optional connectOpts are passed to ConnectToRoom (e.g. ConnectOptionsFromEnv()).
+func NewTransport(url string, info lksdk.ConnectInfo, sampleRate int, queue func(context.Context, []frames.Frame) error, log protoLogger.Logger, connectOpts ...lksdk.ConnectOption) *Transport {
 	if sampleRate <= 0 {
 		sampleRate = 16000
 	}
 	if log == nil {
 		log = protoLogger.GetLogger()
 	}
-	return &Transport{URL: url, Info: info, SampleRate: sampleRate, queue: queue, Logger: log}
+	return &Transport{URL: url, Info: info, SampleRate: sampleRate, queue: queue, Logger: log, connectOpts: append([]lksdk.ConnectOption(nil), connectOpts...)}
 }
 
 // Connect joins the room, publishes a PCM local track, and wires the first subscribed mic to queue.
 func (t *Transport) Connect(ctx context.Context) error {
 	cb := &lksdk.RoomCallback{
+		OnParticipantDisconnected: t.onRemoteParticipantDisconnected,
+		OnDisconnected:            t.onRoomDisconnected,
 		ParticipantCallback: lksdk.ParticipantCallback{
 			OnTrackSubscribed: t.onTrackSubscribed,
 		},
 	}
-	room, err := lksdk.ConnectToRoom(t.URL, t.Info, cb, lksdk.WithAutoSubscribe(true))
+	opts := append([]lksdk.ConnectOption(nil), t.connectOpts...)
+	if len(opts) == 0 {
+		opts = []lksdk.ConnectOption{lksdk.WithAutoSubscribe(true)}
+	}
+	room, err := lksdk.ConnectToRoom(t.URL, t.Info, cb, opts...)
 	if err != nil {
 		return err
 	}
@@ -76,6 +90,10 @@ func (t *Transport) Connect(ctx context.Context) error {
 
 // Disconnect leaves the room and closes the published track.
 func (t *Transport) Disconnect() {
+	t.intentMu.Lock()
+	t.closing = true
+	t.intentMu.Unlock()
+
 	t.mu.Lock()
 	room := t.room
 	lt := t.localPCM
@@ -88,6 +106,45 @@ func (t *Transport) Disconnect() {
 	}
 	if room != nil {
 		room.Disconnect()
+	}
+
+	t.intentMu.Lock()
+	t.closing = false
+	t.intentMu.Unlock()
+}
+
+func (t *Transport) onRemoteParticipantDisconnected(rp *lksdk.RemoteParticipant) {
+	if rp == nil {
+		return
+	}
+	t.mu.RLock()
+	room := t.room
+	t.mu.RUnlock()
+	if room == nil {
+		return
+	}
+	if rp.Identity() == room.LocalParticipant.Identity() {
+		return
+	}
+	t.fireOnDisconnect()
+}
+
+func (t *Transport) onRoomDisconnected() {
+	t.intentMu.Lock()
+	closing := t.closing
+	t.intentMu.Unlock()
+	if closing {
+		return
+	}
+	t.fireOnDisconnect()
+}
+
+func (t *Transport) fireOnDisconnect() {
+	t.mu.RLock()
+	fn := t.OnDisconnect
+	t.mu.RUnlock()
+	if fn != nil {
+		fn()
 	}
 }
 
@@ -109,7 +166,9 @@ func (t *Transport) onTrackSubscribed(track *webrtc.TrackRemote, _ *lksdk.Remote
 		_, err := lkmedia.NewPCMRemoteTrack(track, w, lkmedia.WithTargetSampleRate(t.SampleRate))
 		if err != nil {
 			t.Logger.Errorw("livekit pcm remote track", err)
+			return
 		}
+		log.Printf("llmpipe: livekit — remote Opus mic wired into pipeline (participant %q)", rp.Identity())
 	})
 }
 

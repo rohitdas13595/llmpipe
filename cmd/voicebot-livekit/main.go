@@ -3,17 +3,22 @@ package main
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"os/signal"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
 	"github.com/rohitdas13595/llmpipe/aggregate"
 	"github.com/rohitdas13595/llmpipe/audio/interrupt"
 	"github.com/rohitdas13595/llmpipe/audio/vad"
+	ex "github.com/rohitdas13595/llmpipe/examples"
 	"github.com/rohitdas13595/llmpipe/frames"
 	"github.com/rohitdas13595/llmpipe/observe"
 	"github.com/rohitdas13595/llmpipe/pipeline"
@@ -28,8 +33,9 @@ import (
 	"github.com/rohitdas13595/llmpipe/services/sarvam"
 	lktransport "github.com/rohitdas13595/llmpipe/transport/livekit"
 
-	lksdk "github.com/livekit/server-sdk-go/v2"
+	"github.com/livekit/protocol/auth"
 	protoLogger "github.com/livekit/protocol/logger"
+	lksdk "github.com/livekit/server-sdk-go/v2"
 	"google.golang.org/genai"
 
 	"github.com/joho/godotenv"
@@ -48,6 +54,14 @@ func main() {
 	apiSecret := os.Getenv("LIVEKIT_API_SECRET")
 	if apiKey == "" || apiSecret == "" {
 		log.Fatal("LIVEKIT_API_KEY and LIVEKIT_API_SECRET are required")
+	}
+
+	demoAddr := strings.TrimSpace(os.Getenv("LIVEKIT_DEMO_LISTEN"))
+	if demoAddr == "" {
+		demoAddr = ":8090"
+	}
+	if !strings.EqualFold(demoAddr, "off") && demoAddr != "-" {
+		go startLiveKitDemoServer(demoAddr, url, room, apiKey, apiSecret)
 	}
 
 	sampleRate := 16000
@@ -69,6 +83,17 @@ func main() {
 	strategy := interrupt.MinWords{N: 1}
 
 	var task *pipeline.PipelineTask
+	var endOnce sync.Once
+	endPipeline := func(reason string) {
+		endOnce.Do(func() {
+			log.Printf("end pipeline: %s", reason)
+			if task != nil {
+				_ = task.QueueFrames(context.Background(), []frames.Frame{&frames.EndFrame{}})
+				task.Cancel()
+			}
+		})
+	}
+
 	reenter := func(ctx context.Context, name string, f frames.Frame) error {
 		if task == nil {
 			return nil
@@ -90,9 +115,9 @@ func main() {
 	}
 	vadP := vad.NewProcessor("vad", vad.NewEnergyAnalyzer(vadTh, envIntOr("VAD_MIN_SPEECH", 2), envIntOr("VAD_MIN_SILENCE", 6)))
 
-	userIdle := idle.NewUserProcessor("user.idle", 2*time.Minute, func(retry int) bool {
-		log.Printf("user idle callback retry=%d", retry)
-		return retry < 2
+	userIdle := idle.NewUserProcessor("user.idle", time.Minute, func(retry int) bool {
+		endPipeline(fmt.Sprintf("user idle 1m — pipeline task only, demo/LiveKit process keeps running (retry=%d)", retry))
+		return false
 	})
 
 	tr := lktransport.NewTransport(url, lksdk.ConnectInfo{
@@ -105,12 +130,7 @@ func main() {
 			return nil
 		}
 		return task.QueueFrames(ctx, ff)
-	}, protoLogger.GetLogger())
-
-	if err := tr.Connect(context.Background()); err != nil {
-		log.Fatal("livekit connect:", err)
-	}
-	defer tr.Disconnect()
+	}, protoLogger.GetLogger(), lktransport.ConnectOptionsFromEnv()...)
 
 	procs := []processor.Processor{
 		userIdle,
@@ -138,18 +158,78 @@ func main() {
 
 	task = pipeline.NewPipelineTask(p, pipeline.WithIdleObserver(idleObs))
 
+	tr.OnDisconnect = func() {
+		endPipeline("livekit remote participant left or room disconnected")
+	}
+
+	if err := tr.Connect(context.Background()); err != nil {
+		log.Fatal("livekit connect:", err)
+	}
+	defer tr.Disconnect()
+
+	log.Printf("llmpipe: livekit room joined room=%q agent=%q sampleRate=%d (Pion ICE/TURN lines are WebRTC, not frame pipeline; STT/LLM/TTS are silent unless they error)", room, identity, sampleRate)
+
 	_ = task.QueueFrames(context.Background(), []frames.Frame{
 		&frames.StartFrame{SampleRate: sampleRate, NumChannels: 1},
 	})
+	log.Printf("llmpipe: StartFrame queued — waiting for remote participant + Opus track before audio reaches VAD/STT")
 
 	rootCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	log.Printf("voicebot-livekit connected room=%q identity=%q sampleRate=%d", room, identity, sampleRate)
-
 	runner := pipeline.NewRunner(false)
 	if err := runner.Run(rootCtx, task); err != nil && err != context.Canceled {
 		log.Println("runner:", err)
+	}
+	log.Println("pipeline task stopped; process still running (demo HTTP + LiveKit) until SIGINT/SIGTERM")
+	<-rootCtx.Done()
+}
+
+func startLiveKitDemoServer(addr, livekitURL, defaultRoom, apiKey, apiSecret string) {
+	mux := http.NewServeMux()
+	mux.Handle("/demo/", http.StripPrefix("/demo/", http.FileServer(http.FS(ex.FS))))
+	mux.HandleFunc("/api/livekit-token", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		roomName := strings.TrimSpace(r.URL.Query().Get("room"))
+		if roomName == "" {
+			roomName = defaultRoom
+		}
+		identity := strings.TrimSpace(r.URL.Query().Get("identity"))
+		if identity == "" {
+			identity = fmt.Sprintf("web-%d", time.Now().UnixNano())
+		}
+		at := auth.NewAccessToken(apiKey, apiSecret).
+			SetIdentity(identity).
+			SetValidFor(6 * time.Hour).
+			SetVideoGrant(&auth.VideoGrant{
+				RoomJoin: true,
+				Room:     roomName,
+			})
+		token, err := at.ToJWT()
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(struct {
+			ServerURL string `json:"serverUrl"`
+			Token     string `json:"token"`
+			Room      string `json:"room"`
+			Identity  string `json:"identity"`
+		}{ServerURL: livekitURL, Token: token, Room: roomName, Identity: identity})
+	})
+	show := addr
+	if strings.HasPrefix(show, ":") {
+		show = "127.0.0.1" + show
+	} else if strings.HasPrefix(show, "0.0.0.0:") {
+		show = "127.0.0.1:" + strings.TrimPrefix(show, "0.0.0.0:")
+	}
+	log.Printf("livekit demo UI http://%s/demo/livekit-voicebot-client.html · GET /api/livekit-token", show)
+	if err := http.ListenAndServe(addr, mux); err != nil {
+		log.Fatal("livekit demo http:", err)
 	}
 }
 

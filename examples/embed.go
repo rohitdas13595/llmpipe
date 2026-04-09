@@ -1,4 +1,4 @@
-// Package examples embeds static HTML demos for llmpipe (served by cmd/voicebot).
+// Package examples embeds static HTML demos for llmpipe (served by cmd/voicebot and cmd/voicebot-livekit).
 package examples
 
 import "embed"

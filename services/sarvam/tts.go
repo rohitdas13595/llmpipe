@@ -8,7 +8,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
 	"os"
 	"strings"
@@ -17,6 +16,7 @@ import (
 	"github.com/rohitdas13595/llmpipe/aggregate"
 	"github.com/rohitdas13595/llmpipe/frames"
 	"github.com/rohitdas13595/llmpipe/processor"
+	"github.com/rohitdas13595/llmpipe/services"
 )
 
 const ttsURL = "https://api.sarvam.ai/text-to-speech"
@@ -85,21 +85,26 @@ func (t *TTS) flushBufferedText(ctx context.Context, emit processor.Emit) {
 		return
 	}
 	if strings.TrimSpace(t.APIKey) == "" {
-		log.Println("sarvam: SARVAM_API_KEY is empty")
+		services.PipelineLog("tts", "sarvam: SARVAM_API_KEY is empty")
 		emit.Down(&frames.ErrorFrame{Err: fmt.Errorf("sarvam: missing API key")})
 		return
 	}
+	preview := text
+	if len(preview) > 120 {
+		preview = preview[:120] + "…"
+	}
+	services.PipelineLog("tts", "sarvam: synthesizing %d chars, preview: %q", len(text), preview)
 	pcm, sr, err := t.synth(ctx, text)
 	if err != nil {
-		log.Println("sarvam:", err)
+		services.PipelineLog("tts", "sarvam: %v", err)
 		emit.Down(&frames.ErrorFrame{Err: err})
 		return
 	}
 	if len(pcm) == 0 {
-		log.Println("sarvam: empty PCM from API")
+		services.PipelineLog("tts", "sarvam: empty PCM from API")
 		return
 	}
-	log.Printf("sarvam: synthesized %d bytes PCM (%d Hz) for %d chars", len(pcm), sr, len(text))
+	services.PipelineLog("tts", "sarvam: synthesized %d bytes PCM (%d Hz) for %d chars", len(pcm), sr, len(text))
 	if t.Bot != nil {
 		t.Bot.SetSpeaking(true)
 	}

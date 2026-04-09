@@ -66,6 +66,8 @@ func (u *UserProcessor) Process(ctx context.Context, f frames.Frame, dir process
 	switch f.(type) {
 	case *frames.StartFrame:
 		u.started = true
+		// Arm inactivity timer from session start so silent clients (no VAD / STT frames) still time out.
+		u.armTimer()
 	case *frames.UserStartedSpeakingFrame, *frames.TranscriptionFrame, *frames.BotStoppedSpeakingFrame:
 		if u.started {
 			u.mu.Lock()

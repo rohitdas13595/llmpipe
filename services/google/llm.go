@@ -3,7 +3,6 @@ package google
 import (
 	"context"
 	"fmt"
-	"log"
 	"sync"
 
 	"google.golang.org/genai"
@@ -53,7 +52,7 @@ func (l *LLM) Process(ctx context.Context, f frames.Frame, dir processor.Directi
 			emit.Down(&frames.ErrorFrame{Err: fmt.Errorf("google llm: client or Reenter nil")})
 			return nil
 		}
-		log.Printf("%s: LLMRunFrame → Gemini stream model=%q", l.name, l.Model)
+		services.PipelineLog("llm", "%s: LLMRunFrame → Gemini stream model=%q", l.name, l.Model)
 		go l.stream(context.Background())
 	default:
 		emit.Down(f)
@@ -103,29 +102,29 @@ func (l *LLM) stream(bg context.Context) {
 		cfg.SystemInstruction = sys
 	}
 
-	log.Printf("%s: GenerateContentStream model=%q contents=%d", l.name, l.Model, len(contents))
+	services.PipelineLog("llm", "%s: GenerateContentStream model=%q contents=%d", l.name, l.Model, len(contents))
 	_ = l.Reenter(ctx, l.name, &frames.LLMFullResponseStartFrame{})
 	stream := l.Client.Models.GenerateContentStream(ctx, l.Model, contents, cfg)
 	textChunks := 0
 	for resp, err := range stream {
 		if ctx.Err() != nil {
-			log.Printf("%s: stream cancelled (%v)", l.name, ctx.Err())
+			services.PipelineLog("llm", "%s: stream cancelled (%v)", l.name, ctx.Err())
 			break
 		}
 		if err != nil {
-			log.Printf("%s: stream error: %v", l.name, err)
+			services.PipelineLog("llm", "%s: stream error: %v", l.name, err)
 			_ = l.Reenter(ctx, l.name, &frames.ErrorFrame{Err: err})
 			break
 		}
 		if len(resp.Candidates) == 0 {
 			if resp.PromptFeedback != nil {
-				log.Printf("%s: no candidates (prompt_feedback=%+v)", l.name, resp.PromptFeedback)
+				services.PipelineLog("llm", "%s: no candidates (prompt_feedback=%+v)", l.name, resp.PromptFeedback)
 			}
 			continue
 		}
 		for _, cand := range resp.Candidates {
 			if cand.FinishReason != "" && cand.FinishReason != genai.FinishReasonStop {
-				log.Printf("%s: candidate finish_reason=%s", l.name, cand.FinishReason)
+				services.PipelineLog("llm", "%s: candidate finish_reason=%s", l.name, cand.FinishReason)
 			}
 			if cand.Content == nil {
 				continue
@@ -141,8 +140,8 @@ func (l *LLM) stream(bg context.Context) {
 		}
 	}
 	if textChunks == 0 {
-		log.Printf("%s: no text tokens streamed (safety filter, thinking-only output, or API issue) — TTS will not run", l.name)
+		services.PipelineLog("llm", "%s: no text tokens streamed (safety filter, thinking-only output, or API issue) — TTS will not run", l.name)
 	}
 	_ = l.Reenter(ctx, l.name, &frames.LLMFullResponseEndFrame{})
-	log.Printf("%s: stream finished (%d text chunks)", l.name, textChunks)
+	services.PipelineLog("llm", "%s: stream finished (%d text chunks)", l.name, textChunks)
 }

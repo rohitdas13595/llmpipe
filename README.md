@@ -4,7 +4,13 @@
 
 ## Documentation
 
-**[Full architecture & API reference → `docs/REFERENCE.md](docs/REFERENCE.md)`** — detailed guide covering:
+Files in [`docs/`](docs/):
+
+| Document | Description |
+| -------- | ----------- |
+| [`REFERENCE.md`](docs/REFERENCE.md) | Full architecture and API reference for the module |
+
+**[`docs/REFERENCE.md`](docs/REFERENCE.md)** covers:
 
 - Pipeline mental model, frame flow, and **async `ReenterAfter`** for STT/LLM
 - Package map, core types (`Pipeline`, `PipelineTask`, `Runner`, `Processor`, frames)
@@ -71,6 +77,10 @@ Static copies of the same HTML also live under `examples/` if you want to open o
 
 
 The bot publishes an **Opus** track decoded/encoded via the LiveKit SDK; internal pipeline uses the configured `SAMPLE_RATE` (default 16 kHz).
+
+With the agent running, open **[http://127.0.0.1:8090/demo/livekit-voicebot-client.html](http://127.0.0.1:8090/demo/livekit-voicebot-client.html)** (default `LIVEKIT_DEMO_LISTEN=:8090`) to join the same room from the browser; the page calls **`GET /api/livekit-token`** to mint a viewer token. Set **`LIVEKIT_DEMO_LISTEN=off`** to turn off that HTTP server.
+
+**Connection timeouts or `i/o timeout` to `*.livekit.cloud:443`:** the agent uses a **30s** signalling timeout by default (override with **`LIVEKIT_CONNECT_TIMEOUT`**). If your network blocks some LiveKit edges, try **`LIVEKIT_DISABLE_REGION_DISCOVERY=1`** so only **`LIVEKIT_URL`** is used. You still need outbound **HTTPS/WSS on 443** and working **WebRTC** (UDP or TURN); restrictive firewalls and broken IPv6 can block TURN—try another network or VPN, or **`LIVEKIT_ICE_TRANSPORT=relay`**.
 
 ## Tests
 

@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
 	"math"
 	"net/http"
 	"net/url"
@@ -101,17 +100,18 @@ func (s *STT) flush(ctx context.Context) {
 		return
 	}
 	if s.APIKey == "" {
-		log.Println("deepgram: DEEPGRAM_API_KEY is empty; set it in .env")
+		services.PipelineLog("stt", "deepgram: DEEPGRAM_API_KEY is empty; set it in .env")
 		_ = s.Reenter(ctx, s.name, &frames.ErrorFrame{Err: fmt.Errorf("deepgram: missing API key")})
 		return
 	}
 	if len(audio) == 0 {
-		log.Println("deepgram: flush skipped (no audio in buffer — did VAD fire end-of-utterance?)")
+		services.PipelineLog("stt", "deepgram: flush skipped (no audio in buffer — did VAD fire end-of-utterance?)")
 		return
 	}
 	if !shouldSendPCMToDeepgram(audio, s.SampleRate) {
 		return
 	}
+	services.PipelineLog("stt", "deepgram: sending %d bytes PCM @ %d Hz for transcript", len(audio), s.SampleRate)
 	q := url.Values{}
 	q.Set("model", s.Model)
 	q.Set("encoding", "linear16")
@@ -129,7 +129,7 @@ func (s *STT) flush(ctx context.Context) {
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		log.Println("deepgram:", err)
+		services.PipelineLog("stt", "deepgram: %v", err)
 		_ = s.Reenter(ctx, s.name, &frames.ErrorFrame{Err: err})
 		return
 	}
@@ -137,13 +137,13 @@ func (s *STT) flush(ctx context.Context) {
 	body, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusOK {
 		err := fmt.Errorf("deepgram: %s: %s", resp.Status, string(body))
-		log.Println("deepgram:", err)
+		services.PipelineLog("stt", "deepgram: %v", err)
 		_ = s.Reenter(ctx, s.name, &frames.ErrorFrame{Err: err})
 		return
 	}
 	var out dgResp
 	if json.Unmarshal(body, &out) != nil {
-		log.Printf("deepgram: invalid json (first 200 chars): %.200q", string(body))
+		services.PipelineLog("stt", "deepgram: invalid json (first 200 chars): %.200q", string(body))
 		_ = s.Reenter(ctx, s.name, &frames.ErrorFrame{Err: fmt.Errorf("deepgram: invalid json")})
 		return
 	}
@@ -153,11 +153,11 @@ func (s *STT) flush(ctx context.Context) {
 	}
 	if text == "" {
 		if os.Getenv("STT_EMPTY_LOG") == "1" {
-			log.Printf("deepgram: no words in %d bytes @ %d Hz (set STT_EMPTY_LOG=0 to hide)", len(audio), s.SampleRate)
+			services.PipelineLog("stt", "deepgram: no words in %d bytes @ %d Hz (set STT_EMPTY_LOG=0 to hide)", len(audio), s.SampleRate)
 		}
 		return
 	}
-	log.Printf("deepgram: transcript %q", text)
+	services.PipelineLog("stt", "deepgram transcript: %q", text)
 	_ = s.Reenter(ctx, s.name, &frames.TranscriptionFrame{Text: text})
 }
 
@@ -192,7 +192,7 @@ func shouldSendPCMToDeepgram(pcm []byte, sampleRate int) bool {
 	}
 	if len(pcm) < minBytes {
 		if os.Getenv("STT_GATE_LOG") == "1" {
-			log.Printf("deepgram: skip API (buffer %d bytes < min %d)", len(pcm), minBytes)
+			services.PipelineLog("stt", "deepgram: skip API (buffer %d bytes < min %d)", len(pcm), minBytes)
 		}
 		return false
 	}
@@ -205,7 +205,7 @@ func shouldSendPCMToDeepgram(pcm []byte, sampleRate int) bool {
 	r := pcmRMS16LE(pcm)
 	if r < minRMS {
 		if os.Getenv("STT_GATE_LOG") == "1" {
-			log.Printf("deepgram: skip API (RMS %.1f < %.1f, %d bytes)", r, minRMS, len(pcm))
+			services.PipelineLog("stt", "deepgram: skip API (RMS %.1f < %.1f, %d bytes)", r, minRMS, len(pcm))
 		}
 		return false
 	}

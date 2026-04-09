@@ -262,14 +262,14 @@ Use **`pipeline.WithIdleObserver`** so `Start`/`Stop` align with `task.Run`.
 
 ### WebSocket (`github.com/rohitdas13595/llmpipe/transport/ws`)
 
-- **`NewTransport(sampleRate, queue func(ctx, []frames.Frame) error)`** — `queue` should be `task.QueueFrames`.
+- **`NewTransport(sampleRate, queue func(ctx, []frames.Frame) error)`** — `queue` should be `task.QueueFrames`. Optional **`OnDisconnect`** runs when the WebSocket closes (end session / cancel task).
 - **`Input()`** — passthrough (audio enters via `queue` from `HandleWebSocket`).
 - **`HandleWebSocket`** — upgrades connection, sends `StartFrame`, reads binary PCM as `InputAudioRawFrame`; text control JSON `{"endUtterance":true}` or `end` → `UserStoppedSpeakingFrame`.
 - **`Output()`** — writes `TTSAudioRawFrame` as binary WebSocket messages (serialized writes).
 
 ### LiveKit (`github.com/rohitdas13595/llmpipe/transport/livekit`)
 
-- **`NewTransport(url, ConnectInfo, sampleRate, queue, logger)`**
+- **`NewTransport(url, ConnectInfo, sampleRate, queue, logger, connectOpts...)`** — optional SDK options (e.g. **`ConnectOptionsFromEnv()`** for timeout / region / ICE). Optional **`OnDisconnect`** when a remote participant leaves or the room disconnects (not fired for intentional **`Transport.Disconnect`**).
 - **`Connect(ctx)`** — join room, publish PCM local track, subscribe first remote Opus mic → decode to PCM → `InputAudioRawFrame` via `queue`.
 - **`Input()` / `Output()`** — passthrough in; TTS PCM → `PCMLocalTrack.WriteSample`.
 - **`Disconnect()`** — cleanup.
