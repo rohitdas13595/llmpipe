@@ -1,0 +1,371 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>llmpipe voicebot client</title>
+  <style>
+    :root {
+      --bg: #0f1419;
+      --panel: #1a2332;
+      --text: #e7ecf3;
+      --muted: #8b9cb3;
+      --accent: #3d8bfd;
+      --ok: #3dcc85;
+      --err: #f87171;
+    }
+    * { box-sizing: border-box; }
+    body {
+      font-family: "JetBrains Mono", "SF Mono", ui-monospace, monospace;
+      background: var(--bg);
+      color: var(--text);
+      margin: 0;
+      min-height: 100vh;
+      padding: 1.25rem;
+      line-height: 1.45;
+    }
+    h1 { font-size: 1.1rem; font-weight: 600; margin: 0 0 1rem; letter-spacing: -0.02em; }
+    .panel {
+      background: var(--panel);
+      border-radius: 10px;
+      padding: 1rem 1.1rem;
+      margin-bottom: 1rem;
+      border: 1px solid rgba(255,255,255,.06);
+    }
+    label { display: block; font-size: 0.75rem; color: var(--muted); margin-bottom: 0.25rem; }
+    input[type="text"], input[type="number"] {
+      width: 100%;
+      padding: 0.5rem 0.6rem;
+      border-radius: 6px;
+      border: 1px solid rgba(255,255,255,.12);
+      background: var(--bg);
+      color: var(--text);
+      font: inherit;
+      margin-bottom: 0.75rem;
+    }
+    .row { display: flex; flex-wrap: wrap; gap: 0.75rem; align-items: center; margin-bottom: 0.75rem; }
+    .row label { display: flex; align-items: center; gap: 0.4rem; margin: 0; cursor: pointer; }
+    button {
+      font: inherit;
+      padding: 0.45rem 0.9rem;
+      border-radius: 6px;
+      border: none;
+      cursor: pointer;
+      background: var(--accent);
+      color: #fff;
+    }
+    button:disabled { opacity: 0.45; cursor: not-allowed; }
+    button.secondary { background: rgba(255,255,255,.12); color: var(--text); }
+    button.danger { background: var(--err); }
+    #log {
+      height: 200px;
+      overflow: auto;
+      font-size: 0.72rem;
+      background: #0a0e12;
+      padding: 0.6rem 0.75rem;
+      border-radius: 6px;
+      white-space: pre-wrap;
+      word-break: break-all;
+      color: var(--muted);
+    }
+    #log .i { color: var(--ok); }
+    #log .w { color: #fbbf24; }
+    #log .e { color: var(--err); }
+    .hint { font-size: 0.72rem; color: var(--muted); margin-top: 0.5rem; }
+    a { color: var(--accent); }
+  </style>
+</head>
+<body>
+  <h1>llmpipe · WebSocket voice client</h1>
+
+  <div class="panel">
+    <label for="wsUrl">WebSocket URL (must match server <code>SAMPLE_RATE</code>)</label>
+    <input type="text" id="wsUrl" autocomplete="off" spellcheck="false"
+      placeholder="ws://127.0.0.1:8080/ws">
+
+    <label for="sampleRate">PCM sample rate (Hz)</label>
+    <input type="number" id="sampleRate" value="16000" min="8000" max="48000" step="1000">
+
+    <div class="row">
+      <label><input type="checkbox" id="pushToTalk"> Push-to-talk (hold button to send mic)</label>
+    </div>
+
+    <div class="row">
+      <button type="button" id="btnConnect">Connect</button>
+      <button type="button" id="btnDisconnect" class="secondary" disabled>Disconnect</button>
+      <button type="button" id="btnMic" disabled>Start microphone</button>
+      <button type="button" id="btnEndUtterance" class="secondary" disabled>End utterance</button>
+      <button type="button" id="btnPtt" class="secondary" disabled style="display:none">Hold to talk</button>
+    </div>
+
+    <p class="hint">
+      Protocol: binary messages = <strong>s16le mono PCM</strong>. Server sends the same for TTS.
+      After speaking, pause briefly so VAD can detect end of speech, or click <strong>End utterance</strong> to force transcription.
+      Serve this page from the voicebot at <a href="./">/demo/</a> so the default WebSocket URL matches your host.
+    </p>
+  </div>
+
+  <div class="panel">
+    <label>Log</label>
+    <div id="log"></div>
+  </div>
+
+  <script>
+(function () {
+  const TARGET_RATE = () => Math.max(8000, Math.min(48000, parseInt(document.getElementById('sampleRate').value, 10) || 16000));
+
+  const wsUrlInput = document.getElementById('wsUrl');
+  const logEl = document.getElementById('log');
+  const btnConnect = document.getElementById('btnConnect');
+  const btnDisconnect = document.getElementById('btnDisconnect');
+  const btnMic = document.getElementById('btnMic');
+  const btnEndUtterance = document.getElementById('btnEndUtterance');
+  const btnPtt = document.getElementById('btnPtt');
+  const pttCheck = document.getElementById('pushToTalk');
+  let ttsChunks = 0;
+
+  function log(msg, cls) {
+    const line = document.createElement('div');
+    line.className = cls || '';
+    line.textContent = new Date().toISOString().slice(11, 23) + ' ' + msg;
+    logEl.appendChild(line);
+    logEl.scrollTop = logEl.scrollHeight;
+  }
+
+  function defaultWsUrl() {
+    const u = new URL(window.location.href);
+    if (u.protocol === 'file:') return 'ws://127.0.0.1:8080/ws';
+    u.protocol = u.protocol === 'https:' ? 'wss:' : 'ws:';
+    u.pathname = '/ws';
+    u.search = '';
+    u.hash = '';
+    return u.toString();
+  }
+  if (!wsUrlInput.value) wsUrlInput.value = defaultWsUrl();
+
+  /** @type {WebSocket|null} */
+  let ws = null;
+  /** @type {AudioContext|null} */
+  let captureCtx = null;
+  /** @type {AudioContext|null} */
+  let playCtx = null;
+  /** @type {ScriptProcessorNode|null} */
+  let processor = null;
+  /** @type {MediaStream|null} */
+  let mediaStream = null;
+  /** @type {MediaStreamAudioSourceNode|null} */
+  let sourceNode = null;
+  let micOn = false;
+  let nextPlayTime = 0;
+  let pttActive = false;
+
+  function resampleFloat32(input, inputRate, outputRate) {
+    if (inputRate === outputRate) return input;
+    const ratio = inputRate / outputRate;
+    const outLen = Math.max(1, Math.floor(input.length / ratio));
+    const out = new Float32Array(outLen);
+    for (let i = 0; i < outLen; i++) {
+      const srcPos = i * ratio;
+      const j = Math.floor(srcPos);
+      const f = srcPos - j;
+      const s0 = input[j] ?? 0;
+      const s1 = input[j + 1] ?? s0;
+      out[i] = s0 + f * (s1 - s0);
+    }
+    return out;
+  }
+
+  function floatTo16LEPCM(float32) {
+    const buf = new ArrayBuffer(float32.length * 2);
+    const view = new DataView(buf);
+    for (let i = 0; i < float32.length; i++) {
+      let s = Math.max(-1, Math.min(1, float32[i]));
+      view.setInt16(i * 2, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+    }
+    return buf;
+  }
+
+  function ensurePlayContext() {
+    const rate = TARGET_RATE();
+    if (!playCtx || playCtx.state === 'closed') {
+      playCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: rate });
+    }
+    if (playCtx.sampleRate !== rate) {
+      log('Playback context is ' + playCtx.sampleRate + ' Hz (requested ' + rate + '). Timestamps may sound slightly off.', 'w');
+    }
+    return playCtx;
+  }
+
+  function playPCM16(arrayBuffer) {
+    const rate = TARGET_RATE();
+    const ctx = ensurePlayContext();
+    const actualRate = ctx.sampleRate;
+    const samples = arrayBuffer.byteLength / 2;
+    const view = new DataView(arrayBuffer);
+    let floats = new Float32Array(samples);
+    for (let i = 0; i < samples; i++) {
+      floats[i] = view.getInt16(i * 2, true) / 0x8000;
+    }
+    if (actualRate !== rate) {
+      floats = resampleFloat32(floats, rate, actualRate);
+    }
+    const buffer = ctx.createBuffer(1, floats.length, actualRate);
+    buffer.copyToChannel(floats, 0);
+    const now = ctx.currentTime;
+    const start = Math.max(now, nextPlayTime);
+    const src = ctx.createBufferSource();
+    src.buffer = buffer;
+    src.connect(ctx.destination);
+    src.start(start);
+    nextPlayTime = start + buffer.duration;
+  }
+
+  function stopMic() {
+    micOn = false;
+    btnMic.textContent = 'Start microphone';
+    if (processor) {
+      try { processor.disconnect(); } catch (e) {}
+      processor = null;
+    }
+    if (sourceNode) {
+      try { sourceNode.disconnect(); } catch (e) {}
+      sourceNode = null;
+    }
+    if (mediaStream) {
+      mediaStream.getTracks().forEach(t => t.stop());
+      mediaStream = null;
+    }
+    if (captureCtx && captureCtx.state !== 'closed') {
+      captureCtx.close().catch(() => {});
+      captureCtx = null;
+    }
+  }
+
+  function sendPcmChunk(float32) {
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    const outRate = TARGET_RATE();
+    const inRate = captureCtx ? captureCtx.sampleRate : outRate;
+    const res = resampleFloat32(float32, inRate, outRate);
+    const pcm = floatTo16LEPCM(res);
+    ws.send(pcm);
+  }
+
+  async function startMic() {
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      log('Connect WebSocket first.', 'e');
+      return;
+    }
+    stopMic();
+    mediaStream = await navigator.mediaDevices.getUserMedia({
+      audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true },
+      video: false
+    });
+    captureCtx = new (window.AudioContext || window.webkitAudioContext)();
+    await captureCtx.resume();
+    sourceNode = captureCtx.createMediaStreamSource(mediaStream);
+    const bufferSize = 2048;
+    processor = captureCtx.createScriptProcessor(bufferSize, 1, 1);
+    processor.onaudioprocess = (ev) => {
+      if (!micOn) return;
+      const input = ev.inputBuffer.getChannelData(0);
+      const copy = new Float32Array(input.length);
+      copy.set(input);
+      const ptt = pttCheck.checked;
+      if (ptt && !pttActive) return;
+      sendPcmChunk(copy);
+    };
+    sourceNode.connect(processor);
+    processor.connect(captureCtx.destination);
+    micOn = true;
+    btnMic.textContent = 'Stop microphone';
+    log('Microphone on · capture ' + captureCtx.sampleRate + ' Hz → server ' + TARGET_RATE() + ' Hz', 'i');
+  }
+
+  btnConnect.onclick = () => {
+    if (ws) ws.close();
+    const url = wsUrlInput.value.trim();
+    log('Connecting ' + url + ' …');
+    ws = new WebSocket(url);
+    ws.binaryType = 'arraybuffer';
+    ws.onopen = () => {
+      log('WebSocket open.', 'i');
+      btnConnect.disabled = true;
+      btnDisconnect.disabled = false;
+      btnMic.disabled = false;
+      btnEndUtterance.disabled = false;
+      nextPlayTime = 0;
+      ttsChunks = 0;
+      syncPttUI();
+    };
+    ws.onclose = (ev) => {
+      log('WebSocket closed (' + ev.code + ').', 'w');
+      btnConnect.disabled = false;
+      btnDisconnect.disabled = true;
+      btnMic.disabled = true;
+      btnEndUtterance.disabled = true;
+      stopMic();
+      syncPttUI();
+    };
+    ws.onerror = () => log('WebSocket error.', 'e');
+    ws.onmessage = (ev) => {
+      if (ev.data instanceof ArrayBuffer) {
+        const ctx = ensurePlayContext();
+        if (ctx.state === 'suspended') {
+          ctx.resume().then(() => log('AudioContext resumed for playback.', 'i')).catch(() => {});
+        }
+        ttsChunks++;
+        if (ttsChunks <= 3 || (ttsChunks % 10 === 0)) {
+          log('TTS audio chunk #' + ttsChunks + ' (' + ev.data.byteLength + ' bytes)', 'i');
+        }
+        playPCM16(ev.data);
+      }
+    };
+  };
+
+  btnEndUtterance.onclick = () => {
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    ws.send(JSON.stringify({ endUtterance: true }));
+    log('Sent end utterance (force STT).', 'i');
+  };
+
+  btnDisconnect.onclick = () => {
+    if (ws) ws.close();
+    ws = null;
+  };
+
+  btnMic.onclick = async () => {
+    if (micOn) {
+      stopMic();
+      log('Microphone off.', 'w');
+      return;
+    }
+    try {
+      await startMic();
+    } catch (e) {
+      log('getUserMedia failed: ' + e, 'e');
+    }
+  };
+
+  function syncPttUI() {
+    const ptt = pttCheck.checked;
+    btnPtt.style.display = ptt ? 'inline-block' : 'none';
+    btnPtt.disabled = !ptt || !ws || ws.readyState !== WebSocket.OPEN;
+  }
+
+  pttCheck.onchange = syncPttUI;
+
+  btnPtt.onmousedown = btnPtt.ontouchstart = (e) => {
+    e.preventDefault();
+    pttActive = true;
+  };
+  btnPtt.onmouseup = btnPtt.onmouseleave = btnPtt.ontouchend = () => {
+    pttActive = false;
+  };
+
+  document.getElementById('sampleRate').addEventListener('change', () => {
+    log('Sample rate set to ' + TARGET_RATE() + ' Hz (must match voicebot SAMPLE_RATE).', 'w');
+  });
+})();
+  </script>
+</body>
+</html>

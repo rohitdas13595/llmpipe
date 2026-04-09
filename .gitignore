@@ -1,0 +1,2 @@
+# Local secrets (keep your real keys here; use .env.example as the template)
+.env
