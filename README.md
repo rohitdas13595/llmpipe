@@ -78,3 +78,7 @@ The bot publishes an **Opus** track decoded/encoded via the LiveKit SDK; interna
 go test ./...
 ```
 
+## License
+
+This project is licensed under the [GNU Affero General Public License v3.0](LICENSE). See [CONTRIBUTING.md](CONTRIBUTING.md) for how to contribute.
+
