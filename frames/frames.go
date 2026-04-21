@@ -30,6 +30,9 @@ const (
 	KindLLMFullResponseEnd       = "LLMFullResponseEnd"
 	KindLLMSetTools              = "LLMSetTools"
 	KindFunctionCallResult       = "FunctionCallResult"
+	KindTurnStarted              = "TurnStarted"
+	KindTurnEnded                = "TurnEnded"
+	KindTransportMessage         = "TransportMessage"
 )
 
 type StartFrame struct {
@@ -157,3 +160,25 @@ type FunctionCallResultFrame struct {
 }
 
 func (f *FunctionCallResultFrame) FrameKind() string { return KindFunctionCallResult }
+
+// TurnStartedFrame marks the start of a user speaking turn (Pipecat turn observer).
+type TurnStartedFrame struct {
+	Index int
+}
+
+func (f *TurnStartedFrame) FrameKind() string { return KindTurnStarted }
+
+// TurnEndedFrame marks the end of a user turn after UserStoppedSpeaking or an interruption.
+type TurnEndedFrame struct {
+	Index    int
+	Complete bool // false if interrupted before a full stop
+}
+
+func (f *TurnEndedFrame) FrameKind() string { return KindTurnEnded }
+
+// TransportMessageFrame carries JSON from Pipecat protobuf MessageFrame / transport control paths.
+type TransportMessageFrame struct {
+	Data string
+}
+
+func (f *TransportMessageFrame) FrameKind() string { return KindTransportMessage }
