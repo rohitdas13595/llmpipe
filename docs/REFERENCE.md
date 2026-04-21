@@ -44,14 +44,25 @@ Typical **voicebot** order (as in `cmd/voicebot/main.go`):
 | `github.com/rohitdas13595/llmpipe/services` | `LLM`, `STT`, `TTS` type aliases + `ReenterFunc` |
 | `github.com/rohitdas13595/llmpipe/aggregate` | `LLMContext`, `UserAggregator`, `AssistantAggregator`, `BotState` |
 | `github.com/rohitdas13595/llmpipe/observe` | `FrameObserver`, `IdleFrameObserver` |
+| `github.com/rohitdas13595/llmpipe/transcriptions` | BCP 47 language codes + `ResolveLanguage` (Pipecat `transcriptions/language.py`) |
+| `github.com/rohitdas13595/llmpipe/transport/base` | `Params` — subset of Pipecat `TransportParams` |
 | `github.com/rohitdas13595/llmpipe/transport/ws` | WebSocket PCM in/out |
+| `github.com/rohitdas13595/llmpipe/transport/websocket/server` | Aliases to `transport/ws` (Pipecat “websocket server”) |
+| `github.com/rohitdas13595/llmpipe/transport/websocket/client` | Outbound WebSocket PCM client (`Connect` + read loop) |
 | `github.com/rohitdas13595/llmpipe/transport/livekit` | LiveKit room: Opus mic → PCM queue, TTS → published PCM |
+| `github.com/rohitdas13595/llmpipe/transport/local` | PCM over `io.Reader` / `io.Writer` + `StartInput` |
+| `github.com/rohitdas13595/llmpipe/transport/whatsapp` | Graph Calling API + webhook verify / HMAC |
+| `github.com/rohitdas13595/llmpipe/transport/tavus` | Tavus REST v2 (`Client`) |
+| `github.com/rohitdas13595/llmpipe/transport/lemonslice` | LemonSlice session REST |
+| `github.com/rohitdas13595/llmpipe/transport/heygen` | HeyGen interactive streaming REST (`streaming.new` / `start` / `stop`) |
+| `github.com/rohitdas13595/llmpipe/transport/smallwebrtc` | `NewPeerConnection` ICE helper (Pion) |
 | `github.com/rohitdas13595/llmpipe/audio/vad` | VAD `Analyzer` + `Processor` |
 | `github.com/rohitdas13595/llmpipe/audio/interrupt` | Barge-in `Strategy` |
 | `github.com/rohitdas13595/llmpipe/audio/turn` | Placeholder for smart-turn / end-of-utterance |
 | `github.com/rohitdas13595/llmpipe/processors/idle` | User idle timer processor |
 | `github.com/rohitdas13595/llmpipe/processors/tools` | Reserved for tool/function-call wiring |
 | `github.com/rohitdas13595/llmpipe/services/*` | Provider-specific STT/LLM/TTS processors |
+| `github.com/rohitdas13595/llmpipe/providers` | Env-based provider wiring; Pipecat mapping in [`PROVIDERS.md`](PROVIDERS.md) |
 
 ---
 
@@ -235,7 +246,7 @@ Atomic flag: is the bot currently speaking? Used for **echo suppression** (STT i
 ### VAD (`github.com/rohitdas13595/llmpipe/audio/vad`)
 
 - **`Analyzer`** — `Analyze(pcm16, sampleRate) (started, stopped bool)`.
-- **`EnergyAnalyzer`** — RMS threshold MVP (tunable threshold / min speech / silence frames).
+- **`EnergyAnalyzer`** — RMS threshold MVP (tunable threshold / min speech / silence **frames**). If **`SilenceStopMS` > 0**, end-of-speech uses **milliseconds** of sub-threshold audio after talk (Pipecat `stop_secs`–style); env **`TURN_SILENCE_MS`** in voicebot sets this.
 - **`Processor`** — on `InputAudioRawFrame`, emits VAD/user start/stop frames and forwards PCM.
 
 ### Interrupt (`github.com/rohitdas13595/llmpipe/audio/interrupt`)
@@ -245,7 +256,9 @@ Atomic flag: is the bot currently speaking? Used for **echo suppression** (STT i
 
 ### Turn (`github.com/rohitdas13595/llmpipe/audio/turn`)
 
-Placeholder **`Analyzer`** for future smart-turn / end-of-utterance without changing frame types.
+- **`SilenceAnalyzer`** — `AppendAudio(pcm, sampleRate, isSpeech) State` for tests or custom stacks (default **3000 ms** stop unless overridden); mirrors Pipecat silence leg of smart-turn.
+- **`TrackingProcessor`** — inserts **`TurnStartedFrame`** / **`TurnEndedFrame`** (with `Complete` false on **`InterruptionFrame`**) after VAD; enable in voicebot with default **`TURN_TRACK=1`**, disable with `TURN_TRACK=0`.
+- **`EndOfTurnML`** — reserved interface for future ML smart-turn models.
 
 ---
 
@@ -258,7 +271,28 @@ Use **`pipeline.WithIdleObserver`** so `Start`/`Stop` align with `task.Run`.
 
 ---
 
+## Transcriptions (`github.com/rohitdas13595/llmpipe/transcriptions`)
+
+- **`Language`** — string alias for BCP 47 tags; constants match Pipecat `Language` (regenerate **`language_constants.go`** with **`go generate ./...`** from the **`transcriptions`** package or run **`llmpipe/scripts/gen_transcription_languages.py`**).
+- **`ResolveLanguage(lang, map[Language]string, useBaseCode)`** — same behavior as Pipecat `resolve_language` (map lookup, then base subtag or full tag with slog warnings).
+
+---
+
+## Serializers (`github.com/rohitdas13595/llmpipe/serializers`)
+
+Pipecat uses `FrameSerializer` with protobuf (`frames.proto`) and provider-specific serializers. llmpipe provides:
+
+- **`Serializer`** — `Serialize(Frame) ([]byte, error)`, `Deserialize([]byte) (Frame, error)`.
+- **`Protobuf`** — binary compatible with Pipecat `ProtobufFrameSerializer` / `pipecat.frames.protobufs.frames_pb2` (same `Frame` oneof: text, audio, transcription, message). Regenerate with **`go generate`** in `serializers/pipecatpb/`. Audio on deserialize becomes **`InputAudioRawFrame`** (Python does the same for inbound audio).
+- **`JSON`** — tagged JSON for debugging or custom gateways (`kind` discriminator, base64 audio for `input_audio` / `tts_audio`).
+
+Default WebSocket transport still sends **raw PCM** for TTS and receives raw PCM for mic input; use serializers when building gateways that must match Pipecat’s protobuf WebSocket framing.
+
+---
+
 ## Transports
+
+Pipecat layout includes Daily (not ported here). llmpipe ships **WebSocket server** (`transport/ws`, aliased by `transport/websocket/server`), **WebSocket client** (`transport/websocket/client`), **LiveKit**, **local PCM I/O** (`transport/local`), **WhatsApp** Calling API + webhook helpers, **Tavus** / **LemonSlice** / **HeyGen** HTTP clients, and a **smallwebrtc** Pion `PeerConnection` bootstrap. Tavus/LemonSlice/HeyGen Python transports combine these APIs with Daily/WebRTC media; wire **`Client`** results into **`transport/livekit`** or **`websocket/client`** when you have a room/WebSocket URL. Shared **`transport/base.Params`** mirrors a subset of Pipecat `TransportParams`.
 
 ### WebSocket (`github.com/rohitdas13595/llmpipe/transport/ws`)
 
@@ -266,6 +300,31 @@ Use **`pipeline.WithIdleObserver`** so `Start`/`Stop` align with `task.Run`.
 - **`Input()`** — passthrough (audio enters via `queue` from `HandleWebSocket`).
 - **`HandleWebSocket`** — upgrades connection, sends `StartFrame`, reads binary PCM as `InputAudioRawFrame`; text control JSON `{"endUtterance":true}` or `end` → `UserStoppedSpeakingFrame`.
 - **`Output()`** — writes `TTSAudioRawFrame` as binary WebSocket messages (serialized writes).
+
+### WebSocket client (`github.com/rohitdas13595/llmpipe/transport/websocket/client`)
+
+- **`NewTransport(sampleRate, url, queue)`** — set **`Header`** / **`Dialer`** as needed.
+- **`Connect(ctx)`** — dials **`URL`**, queues **`StartFrame`**, runs read loop (binary PCM + same text control as server transport).
+- **`Input()` / `Output()` / `Close()`** — same roles as `transport/ws`.
+
+### Local (`github.com/rohitdas13595/llmpipe/transport/local`)
+
+- **`NewTransport(sampleRate, in io.Reader, out io.Writer, queue)`** — `In` optional; **`StartInput(ctx)`** reads fixed chunks into **`InputAudioRawFrame`** until EOF; **`Out`** receives **`TTSAudioRawFrame`** bytes (wrap PortAudio / stdin yourself).
+
+### WhatsApp (`github.com/rohitdas13595/llmpipe/transport/whatsapp`)
+
+- **`VerifyWebhookChallenge` / `VerifyWebhookChallengeInt`**, **`ValidateSignature`** (raw body + `X-Hub-Signature-256`).
+- **`NewAPI(token, phoneNumberID).AnswerCall` / `RejectCall` / `TerminateCall`** — Graph **`v23.0`** `/{phone-number-id}/calls`.
+
+### Tavus / LemonSlice / HeyGen (HTTP)
+
+- **`tavus.Client`** — **`CreateConversation`**, **`EndConversation`**, **`GetPersona`**; optional dev room via **`TAVUS_SAMPLE_ROOM_URL`**.
+- **`lemonslice.Client`** — **`CreateSession`**, package **`EndSession`**.
+- **`heygen.Client`** — **`NewInteractiveSession`** / **`CloseSession`** (`api.heygen.com/v1` streaming API).
+
+### Small WebRTC (`github.com/rohitdas13595/llmpipe/transport/smallwebrtc`)
+
+- **`NewPeerConnection(iceURLs []string)`** — Pion peer with STUN/TURN URL list; add tracks and SDP in your app.
 
 ### LiveKit (`github.com/rohitdas13595/llmpipe/transport/livekit`)
 

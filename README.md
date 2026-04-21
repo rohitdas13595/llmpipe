@@ -9,6 +9,7 @@ Files in [`docs/`](docs/):
 | Document | Description |
 | -------- | ----------- |
 | [`REFERENCE.md`](docs/REFERENCE.md) | Full architecture and API reference for the module |
+| [`PROVIDERS.md`](docs/PROVIDERS.md) | Pipecat ↔ llmpipe provider mapping and env vars |
 
 **[`docs/REFERENCE.md`](docs/REFERENCE.md)** covers:
 
@@ -24,7 +25,8 @@ Files in [`docs/`](docs/):
 - `observe` — `FrameObserver`, `IdleFrameObserver`
 - `aggregate` — `LLMContext`, user/assistant aggregators
 - `audio/vad`, `audio/interrupt`, `audio/turn` (stub for smart-turn)
-- `services` — `LLM` / `STT` / `TTS` style processors; OpenAI + Deepgram + ElevenLabs MVP; Google / AWS / Sarvam stubs
+- `services` — provider STT/LLM/TTS + realtime (`openai`, `google`, `anthropic`, `groq`, `whisper`, `assemblyai`, …); see [`docs/PROVIDERS.md`](docs/PROVIDERS.md) for parity with the Python [`pipecat`](../pipecat) tree
+- `providers` — env-based wiring (`providers.BuildSTT` / `BuildLLM` / `BuildTTS`, `PIPELINE=gemini_live|openai_realtime`)
 - `transport/ws`, `transport/livekit` — WebSocket PCM and LiveKit room transport
 
 ## Environment
@@ -44,14 +46,18 @@ Both `**cmd/voicebot**` and `**cmd/voicebot-livekit**` call `godotenv.Load()` at
 | ------------------------------------------- | ---------------------------------------------------------------------------------- |
 | `LISTEN`                                    | HTTP address (default `:8080`)                                                     |
 | `SAMPLE_RATE`                               | PCM rate (default `16000`)                                                         |
-| `STT`                                       | `deepgram` (default), `google`, `aws`, `sarvam`                                    |
-| `LLM`                                       | `openai` (default), `google`                                                       |
-| `TTS`                                       | `elevenlabs` (default), `google`, `aws`, `sarvam`                                  |
-| `OPENAI_API_KEY`, `OPENAI_MODEL`            | OpenAI chat                                                                        |
+| `PIPELINE`                                  | `classic` (default), `gemini_live`, `openai_realtime` — realtime modes skip VAD+STT+LLM+TTS (see [`docs/PROVIDERS.md`](docs/PROVIDERS.md)) |
+| `STT`                                       | `deepgram` (default), `google`, `openai`, `groq`, `assemblyai`, `aws`, `sarvam`     |
+| `LLM`                                       | `openai` (default), `google`, `anthropic`, `groq`                                 |
+| `TTS`                                       | `elevenlabs` (default), `openai`, `google`, `aws`, `sarvam`                         |
+| `OPENAI_API_KEY`, `OPENAI_MODEL`, `OPENAI_BASE_URL` | Chat completions; base URL optional (OpenAI-compatible providers)          |
 | `DEEPGRAM_API_KEY`                          | Deepgram prerecorded (on utterance end)                                            |
 | `ELEVENLABS_API_KEY`, `ELEVENLABS_VOICE_ID` | ElevenLabs PCM                                                                     |
-| `GEMINI_MODEL`                              | Optional; Google LLM uses default client env (`GEMINI_API_KEY` / `GOOGLE_API_KEY`) |
-| `SYSTEM_PROMPT`                             | System message                                                                     |
+| `GEMINI_MODEL`, `GEMINI_API_KEY` / `GOOGLE_API_KEY` | Gemini LLM; for `STT=google` also short audio transcription (`GEMINI_STT_MODEL`) |
+| `GROQ_API_KEY`, `GROQ_MODEL`                | Groq LLM; `STT=groq` uses Whisper on Groq                                           |
+| `ANTHROPIC_API_KEY`, `ANTHROPIC_MODEL`      | Claude when `LLM=anthropic`                                                         |
+| `ASSEMBLYAI_API_KEY`                        | When `STT=assemblyai`                                                               |
+| `SYSTEM_PROMPT`                             | System message / realtime instructions                                             |
 
 
 Clients send **binary WebSocket messages** of **16-bit little-endian mono PCM**; bot replies with PCM chunks.
@@ -65,6 +71,13 @@ With the server running, open:
 (or **[http://127.0.0.1:8080/demo/](http://127.0.0.1:8080/demo/)** for an index). The page is embedded via `go:embed` from `examples/`. It captures the microphone, resamples to the configured rate (default **16000** Hz — must match `SAMPLE_RATE`), streams PCM over `/ws`, and plays bot TTS chunks. Optional **push-to-talk** avoids sending ambient noise.
 
 Static copies of the same HTML also live under `examples/` if you want to open or host them separately.
+
+**Smaller Go examples**
+
+| Command / test | What it shows |
+|----------------|----------------|
+| `go run ./cmd/example-minimal-pipeline` | Single processor + `FrameObserver`, no APIs |
+| `go test -v -run '^Example' ./examples` | `Example*` snippets: `transcriptions`, `serializers`, WhatsApp webhook helpers |
 
 **LiveKit** (`go run ./cmd/voicebot-livekit`):
 
