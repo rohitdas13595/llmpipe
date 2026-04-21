@@ -17,12 +17,16 @@ type Analyzer interface {
 
 // EnergyAnalyzer is a simple RMS threshold VAD (MVP).
 type EnergyAnalyzer struct {
-	Threshold float64 // RMS threshold 0..32768
-	MinSpeech int     // consecutive speech frames to start
-	MinSilence int   // consecutive silence frames to stop
-	speechRun int
-	silenceRun int
-	inSpeech   bool
+	Threshold  float64 // RMS threshold 0..32768
+	MinSpeech  int     // consecutive speech frames to start
+	MinSilence int     // consecutive silence frames to stop (used when SilenceStopMS == 0)
+	// SilenceStopMS, if > 0, ends a turn after this many milliseconds of continuous
+	// sub-threshold audio after speech (Pipecat smart-turn stop_secs style). MinSilence is ignored for stop.
+	SilenceStopMS float64
+	speechRun     int
+	silenceRun    int
+	silenceMsAccum float64
+	inSpeech      bool
 }
 
 func NewEnergyAnalyzer(threshold float64, minSpeech, minSilence int) *EnergyAnalyzer {
@@ -50,19 +54,36 @@ func (e *EnergyAnalyzer) Analyze(pcm16 []byte, sampleRate int) (started, stopped
 	n := float64(len(pcm16) / 2)
 	rms := math.Sqrt(sum / n)
 
+	chunkDurMs := float64(len(pcm16)/2) / float64(sampleRate) * 1000
+	if sampleRate <= 0 {
+		chunkDurMs = float64(len(pcm16)/2) / 16000 * 1000
+	}
+
 	if rms >= e.Threshold {
 		e.speechRun++
 		e.silenceRun = 0
+		e.silenceMsAccum = 0
 		if !e.inSpeech && e.speechRun >= e.MinSpeech {
 			e.inSpeech = true
 			started = true
 		}
 	} else {
-		e.silenceRun++
 		e.speechRun = 0
-		if e.inSpeech && e.silenceRun >= e.MinSilence {
-			e.inSpeech = false
-			stopped = true
+		if e.SilenceStopMS > 0 {
+			if e.inSpeech {
+				e.silenceMsAccum += chunkDurMs
+				if e.silenceMsAccum >= e.SilenceStopMS {
+					e.inSpeech = false
+					e.silenceMsAccum = 0
+					stopped = true
+				}
+			}
+		} else {
+			e.silenceRun++
+			if e.inSpeech && e.silenceRun >= e.MinSilence {
+				e.inSpeech = false
+				stopped = true
+			}
 		}
 	}
 	return started, stopped

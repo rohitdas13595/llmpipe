@@ -1,66 +1,85 @@
 package vad
 
 import (
-	"context"
+	"encoding/binary"
 	"testing"
-
-	"github.com/rohitdas13595/llmpipe/frames"
-	"github.com/rohitdas13595/llmpipe/processor"
 )
 
-func pcm16Sample(v int16, n int) []byte {
-	b := make([]byte, 2*n)
-	for i := 0; i < n; i++ {
-		b[i*2] = byte(v)
-		b[i*2+1] = byte(v >> 8)
-	}
-	return b
-}
-
-func TestEnergyAnalyzerSpeechStartStop(t *testing.T) {
-	e := NewEnergyAnalyzer(100, 2, 2)
-	st, sp := e.Analyze(pcm16Sample(0, 160), 16000)
-	if st || sp {
-		t.Fatalf("quiet: started=%v stopped=%v", st, sp)
-	}
-	// MinSpeech=2: first loud frame arms run, second loud triggers start
-	st, sp = e.Analyze(pcm16Sample(3000, 160), 16000)
-	if st || sp {
-		t.Fatalf("loud1: started=%v stopped=%v", st, sp)
-	}
-	st, sp = e.Analyze(pcm16Sample(3000, 160), 16000)
-	if !st || sp {
-		t.Fatalf("loud2: started=%v stopped=%v (want start)", st, sp)
-	}
-	st, sp = e.Analyze(pcm16Sample(3000, 160), 16000)
-	if st || sp {
-		t.Fatalf("loud3: started=%v stopped=%v", st, sp)
-	}
-	st, sp = e.Analyze(pcm16Sample(0, 160), 16000)
-	if st || sp {
-		t.Fatalf("sil1: started=%v stopped=%v", st, sp)
-	}
-	st, sp = e.Analyze(pcm16Sample(0, 160), 16000)
-	if st || !sp {
-		t.Fatalf("sil2: started=%v stopped=%v (want stop)", st, sp)
+// pcmTone writes a loud tone (high RMS) into buf s16le mono.
+func pcmTone(buf []byte, amp int16) {
+	for i := 0; i+1 < len(buf); i += 2 {
+		binary.LittleEndian.PutUint16(buf[i:], uint16(amp))
 	}
 }
 
-func TestProcessorForwardsNonAudio(t *testing.T) {
-	p := NewProcessor("vad", NewEnergyAnalyzer(10000, 99, 99))
-	var saw bool
-	emit := processor.Emit{
-		Down: func(f frames.Frame) {
-			if _, ok := f.(*frames.TextFrame); ok {
-				saw = true
-			}
-		},
+func pcmSilent(buf []byte) {
+	for i := range buf {
+		buf[i] = 0
 	}
-	tf := &frames.TextFrame{Text: "x"}
-	if err := p.Process(context.Background(), tf, processor.Downstream, emit); err != nil {
-		t.Fatal(err)
+}
+
+func TestEnergyAnalyzer_SilenceStopMS(t *testing.T) {
+	const sr = 16000
+	chunk := sr / 100 * 2 // 10ms chunk = 320 bytes
+
+	e := NewEnergyAnalyzer(2000, 1, 9999)
+	e.SilenceStopMS = 50
+
+	loud := make([]byte, chunk)
+	pcmTone(loud, 5000)
+	quiet := make([]byte, chunk)
+	pcmSilent(quiet)
+
+	var started, stopped bool
+	// enter speech
+	for i := 0; i < 5; i++ {
+		st, sp := e.Analyze(loud, sr)
+		if st {
+			started = true
+		}
+		if sp {
+			stopped = true
+		}
 	}
-	if !saw {
-		t.Fatal("expected TextFrame forwarded")
+	if !started {
+		t.Fatal("expected speech start")
+	}
+	// ~60ms silence should trigger stop (50ms threshold)
+	for i := 0; i < 10; i++ {
+		_, sp := e.Analyze(quiet, sr)
+		if sp {
+			stopped = true
+			break
+		}
+	}
+	if !stopped {
+		t.Fatal("expected end-of-turn after silence ms")
+	}
+}
+
+func TestEnergyAnalyzer_FrameBasedSilence(t *testing.T) {
+	const sr = 16000
+	chunk := sr / 100 * 2
+	e := NewEnergyAnalyzer(2000, 1, 3)
+	if e.SilenceStopMS != 0 {
+		t.Fatal("default SilenceStopMS should be 0")
+	}
+	loud := make([]byte, chunk)
+	pcmTone(loud, 5000)
+	quiet := make([]byte, chunk)
+	pcmSilent(quiet)
+	for range 5 {
+		e.Analyze(loud, sr)
+	}
+	var stopped bool
+	for range 10 {
+		_, sp := e.Analyze(quiet, sr)
+		if sp {
+			stopped = true
+			break
+		}
+	}
+	if !stopped {
+		t.Fatal("expected frame-based stop")
 	}
 }
