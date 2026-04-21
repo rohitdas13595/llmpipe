@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"sync"
@@ -18,10 +19,14 @@ import (
 	"github.com/rohitdas13595/llmpipe/services"
 )
 
-// LLM streams chat completions via the OpenAI API.
+// LLM streams chat completions via the OpenAI-compatible Chat Completions API
+// (Pipecat: OpenAILLMService; set BaseURL to https://api.groq.com/openai/v1 for Groq).
 type LLM struct {
 	name       string
 	APIKey     string
+	BaseURL    string // e.g. https://api.openai.com/v1 (default) or Groq/Together base
+	// APIVersion is optional; when set (e.g. Azure OpenAI), appended as ?api-version= on chat completions.
+	APIVersion string
 	Model      string
 	Ctx        *aggregate.LLMContext
 	Reenter    services.ReenterFunc
@@ -37,12 +42,36 @@ func NewLLM(name, apiKey, model string, c *aggregate.LLMContext, reenter service
 	if model == "" {
 		model = "gpt-4o-mini"
 	}
+	base := os.Getenv("OPENAI_BASE_URL")
+	if base == "" {
+		base = "https://api.openai.com/v1"
+	}
 	return &LLM{
 		name:       name,
 		APIKey:     apiKey,
+		BaseURL:    strings.TrimSuffix(base, "/"),
 		Model:      model,
 		Ctx:        c,
 		Reenter:    reenter,
+		httpClient: http.DefaultClient,
+	}
+}
+
+// NewLLMWithBaseURL is like NewLLM but forces a base URL (Pipecat-style per-provider clients).
+func NewLLMWithBaseURL(name, apiKey, baseURL, model string, c *aggregate.LLMContext, re services.ReenterFunc) *LLM {
+	if baseURL == "" {
+		return NewLLM(name, apiKey, model, c, re)
+	}
+	if model == "" {
+		model = "gpt-4o-mini"
+	}
+	return &LLM{
+		name:       name,
+		APIKey:     apiKey,
+		BaseURL:    strings.TrimSuffix(baseURL, "/"),
+		Model:      model,
+		Ctx:        c,
+		Reenter:    re,
 		httpClient: http.DefaultClient,
 	}
 }
@@ -116,8 +145,22 @@ func (l *LLM) runCompletion(bg context.Context) {
 	msgs := l.Ctx.Snapshot()
 	services.PipelineLog("llm", "%s: POST /v1/chat/completions model=%q messages=%d", l.name, l.Model, len(msgs))
 	body, _ := json.Marshal(chatReq{Model: l.Model, Messages: msgs, Stream: true})
+	base := l.BaseURL
+	if base == "" {
+		base = "https://api.openai.com/v1"
+	}
+	chatURL := strings.TrimSuffix(base, "/") + "/chat/completions"
+	if l.APIVersion != "" {
+		u, err := url.Parse(chatURL)
+		if err == nil {
+			q := u.Query()
+			q.Set("api-version", l.APIVersion)
+			u.RawQuery = q.Encode()
+			chatURL = u.String()
+		}
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
-		"https://api.openai.com/v1/chat/completions", bytes.NewReader(body))
+		chatURL, bytes.NewReader(body))
 	if err != nil {
 		services.PipelineLog("llm", "%s: request error: %v", l.name, err)
 		_ = l.Reenter(ctx, l.name, &frames.ErrorFrame{Err: err})
