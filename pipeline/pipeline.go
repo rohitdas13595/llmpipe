@@ -1,4 +1,4 @@
-// Package pipeline provides Pipeline creation, PipelineTask, and PipelineRunner.
+// Package pipeline provides Pipeline creation, PipelineTask, ParallelPipeline, and PipelineRunner.
 package pipeline
 
 import (

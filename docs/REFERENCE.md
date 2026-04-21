@@ -273,7 +273,7 @@ Use **`pipeline.WithIdleObserver`** so `Start`/`Stop` align with `task.Run`.
 
 ## Transcriptions (`github.com/rohitdas13595/llmpipe/transcriptions`)
 
-- **`Language`** — string alias for BCP 47 tags; constants match Pipecat `Language` (regenerate **`language_constants.go`** with **`go generate ./...`** from the **`transcriptions`** package or run **`go run ./scripts/gen_transcription_languages`** from **`llmpipe`**).
+- **`Language`** — string alias for BCP 47 tags; constants in **`language_constants.go`** track Pipecat `Language` (updated manually when needed).
 - **`ResolveLanguage(lang, map[Language]string, useBaseCode)`** — same behavior as Pipecat `resolve_language` (map lookup, then base subtag or full tag with slog warnings).
 
 ---

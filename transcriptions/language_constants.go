@@ -1,4 +1,4 @@
-// Code generated from Pipecat pipecat/transcriptions/language.py; DO NOT EDIT.
+// Language constants aligned with Pipecat pipecat.transcriptions.language (maintain manually).
 
 package transcriptions
 
