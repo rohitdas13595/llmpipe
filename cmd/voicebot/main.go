@@ -1,4 +1,5 @@
-// Command voicebot is a WebSocket PCM demo: input → VAD → STT → LLM → TTS → output.
+// Command voicebot is a WebSocket PCM demo: input → VAD → STT → LLM → TTS → output,
+// or PIPELINE=gemini_live / openai_realtime (see ../pipecat Parity in docs/PROVIDERS.md).
 package main
 
 import (
@@ -16,22 +17,15 @@ import (
 
 	"github.com/rohitdas13595/llmpipe/aggregate"
 	"github.com/rohitdas13595/llmpipe/audio/interrupt"
+	"github.com/rohitdas13595/llmpipe/audio/turn"
 	"github.com/rohitdas13595/llmpipe/audio/vad"
 	"github.com/rohitdas13595/llmpipe/frames"
 	"github.com/rohitdas13595/llmpipe/observe"
 	"github.com/rohitdas13595/llmpipe/pipeline"
 	"github.com/rohitdas13595/llmpipe/processor"
 	"github.com/rohitdas13595/llmpipe/processors/idle"
-	"github.com/rohitdas13595/llmpipe/services"
-	"github.com/rohitdas13595/llmpipe/services/aws"
-	"github.com/rohitdas13595/llmpipe/services/deepgram"
-	eleven "github.com/rohitdas13595/llmpipe/services/elevenlabs"
-	googlesvc "github.com/rohitdas13595/llmpipe/services/google"
-	"github.com/rohitdas13595/llmpipe/services/openai"
-	"github.com/rohitdas13595/llmpipe/services/sarvam"
+	"github.com/rohitdas13595/llmpipe/providers"
 	"github.com/rohitdas13595/llmpipe/transport/ws"
-
-	"google.golang.org/genai"
 
 	"github.com/joho/godotenv"
 )
@@ -47,14 +41,15 @@ func main() {
 		}
 	}
 
-	llmBackend := strings.ToLower(envOr("LLM", "openai"))
+	llmBackend := strings.ToLower(providers.EnvOr("LLM", "openai"))
 	if llmBackend == "gemini" {
-		llmBackend = "google" // Gemini API via google.golang.org/genai
+		llmBackend = "google"
 	}
-	sttBackend := strings.ToLower(envOr("STT", "deepgram"))
-	ttsBackend := strings.ToLower(envOr("TTS", "elevenlabs"))
+	sttBackend := strings.ToLower(providers.EnvOr("STT", "deepgram"))
+	ttsBackend := strings.ToLower(providers.EnvOr("TTS", "elevenlabs"))
+	pipeMode := providers.PipelineMode()
 
-	ctxLLM := aggregate.NewLLMContext(envOr("SYSTEM_PROMPT", "You are a concise voice assistant."))
+	ctxLLM := aggregate.NewLLMContext(providers.EnvOr("SYSTEM_PROMPT", "You are a concise voice assistant."))
 	bot := aggregate.NewBotState()
 	strategy := interrupt.MinWords{N: 1}
 
@@ -66,10 +61,6 @@ func main() {
 		return task.ReenterAfter(ctx, name, f)
 	}
 
-	stt := buildSTT(sttBackend, reenter, sampleRate, bot)
-	llm := buildLLM(llmBackend, reenter, ctxLLM)
-	tts := buildTTS(ttsBackend, bot, sampleRate)
-
 	userAgg := aggregate.NewUserAggregator("user.agg", ctxLLM, bot, strategy)
 	asst := aggregate.NewAssistantAggregator("assistant", ctxLLM)
 	vadTh := 120.0
@@ -78,7 +69,14 @@ func main() {
 			vadTh = f
 		}
 	}
-	vadP := vad.NewProcessor("vad", vad.NewEnergyAnalyzer(vadTh, envIntOr("VAD_MIN_SPEECH", 2), envIntOr("VAD_MIN_SILENCE", 6)))
+	vadAna := vad.NewEnergyAnalyzer(vadTh, envIntOr("VAD_MIN_SPEECH", 2), envIntOr("VAD_MIN_SILENCE", 6))
+	if v := os.Getenv("TURN_SILENCE_MS"); v != "" {
+		if ms, err := strconv.ParseFloat(v, 64); err == nil && ms > 0 {
+			vadAna.SilenceStopMS = ms
+			log.Printf("VAD: TURN_SILENCE_MS=%.0f (time-based end-of-user-turn)", ms)
+		}
+	}
+	vadP := vad.NewProcessor("vad", vadAna)
 
 	userIdle := idle.NewUserProcessor("user.idle", time.Minute, func(retry int) bool {
 		log.Printf("user idle 1m: end pipeline task only (HTTP server keeps running) retry=%d", retry)
@@ -96,16 +94,44 @@ func main() {
 		return task.QueueFrames(ctx, ff)
 	})
 
-	procs := []processor.Processor{
-		userIdle,
-		tr.Input(),
-		vadP,
-		stt,
-		userAgg,
-		llm,
-		asst,
-		tts,
-		tr.Output(),
+	var procs []processor.Processor
+	switch pipeMode {
+	case "gemini_live", "google_live":
+		log.Printf("PIPELINE=%s (Gemini Live — Pipecat google/gemini_live)", pipeMode)
+		procs = []processor.Processor{
+			userIdle,
+			tr.Input(),
+			providers.BuildGeminiLive(reenter, bot, providers.EnvOr("SYSTEM_PROMPT", "")),
+			tr.Output(),
+		}
+	case "openai_realtime":
+		log.Printf("PIPELINE=openai_realtime (Pipecat openai/realtime)")
+		procs = []processor.Processor{
+			userIdle,
+			tr.Input(),
+			providers.BuildOpenAIRealtime(reenter, bot, providers.EnvOr("SYSTEM_PROMPT", "")),
+			tr.Output(),
+		}
+	default:
+		stt := providers.BuildSTT(sttBackend, reenter, sampleRate, bot)
+		llm := providers.BuildLLM(llmBackend, reenter, ctxLLM)
+		tts := providers.BuildTTS(ttsBackend, bot, sampleRate)
+		procs = []processor.Processor{
+			userIdle,
+			tr.Input(),
+			vadP,
+		}
+		if providers.EnvOr("TURN_TRACK", "1") != "0" {
+			procs = append(procs, turn.NewTrackingProcessor("turn"))
+		}
+		procs = append(procs,
+			stt,
+			userAgg,
+			llm,
+			asst,
+			tts,
+			tr.Output(),
+		)
 	}
 
 	p := pipeline.NewPipeline(procs...)
@@ -130,7 +156,7 @@ func main() {
 		}
 	}
 
-	addr := envOr("LISTEN", ":8080")
+	addr := providers.EnvOr("LISTEN", ":8080")
 	http.Handle("/demo/", http.StripPrefix("/demo/", http.FileServer(http.FS(ex.FS))))
 	http.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
 		if err := tr.HandleWebSocket(w, r); err != nil {
@@ -144,7 +170,8 @@ func main() {
 		} else if strings.HasPrefix(show, "0.0.0.0:") {
 			show = "127.0.0.1:" + strings.TrimPrefix(show, "0.0.0.0:")
 		}
-		log.Printf("voicebot: http://%s/demo/voicebot-client.html · ws://%s/ws (%d Hz s16le mono)", show, show, sampleRate)
+		log.Printf("voicebot: http://%s/demo/voicebot-client.html · ws://%s/ws (%d Hz s16le mono) PIPELINE=%s",
+			show, show, sampleRate, pipeMode)
 		if err := http.ListenAndServe(addr, nil); err != nil {
 			log.Fatal(err)
 		}
@@ -161,13 +188,6 @@ func main() {
 	<-rootCtx.Done()
 }
 
-func envOr(k, def string) string {
-	if v := os.Getenv(k); v != "" {
-		return v
-	}
-	return def
-}
-
 func envIntOr(k string, def int) int {
 	if v := os.Getenv(k); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
@@ -175,51 +195,4 @@ func envIntOr(k string, def int) int {
 		}
 	}
 	return def
-}
-
-func buildSTT(backend string, re services.ReenterFunc, sampleRate int, bot *aggregate.BotState) processor.Processor {
-	switch backend {
-	case "google":
-		return googlesvc.NewSTT("stt", re)
-	case "aws":
-		return aws.NewSTT("stt", re)
-	case "sarvam":
-		return sarvam.NewSTT("stt", re)
-	default:
-		return deepgram.NewSTT("stt", os.Getenv("DEEPGRAM_API_KEY"), re, sampleRate, bot)
-	}
-}
-
-func buildLLM(backend string, re services.ReenterFunc, c *aggregate.LLMContext) processor.Processor {
-	switch backend {
-	case "google":
-		var cfg *genai.ClientConfig
-		if k := strings.TrimSpace(os.Getenv("GEMINI_API_KEY")); k != "" {
-			cfg = &genai.ClientConfig{APIKey: k}
-		} else if k := strings.TrimSpace(os.Getenv("GOOGLE_API_KEY")); k != "" {
-			cfg = &genai.ClientConfig{APIKey: k}
-		}
-		gc, err := genai.NewClient(context.Background(), cfg)
-		if err != nil {
-			log.Fatal("gemini client:", err)
-		}
-		model := envOr("GEMINI_MODEL", "gemini-2.0-flash")
-		log.Printf("LLM backend=google (Gemini) model=%q", model)
-		return googlesvc.NewLLM("llm", model, gc, c, re)
-	default:
-		return openai.NewLLM("llm", os.Getenv("OPENAI_API_KEY"), os.Getenv("OPENAI_MODEL"), c, re)
-	}
-}
-
-func buildTTS(backend string, bot *aggregate.BotState, sampleRate int) processor.Processor {
-	switch backend {
-	case "google":
-		return googlesvc.NewTTS("tts")
-	case "aws":
-		return aws.NewTTS("tts")
-	case "sarvam":
-		return sarvam.NewTTS("tts", os.Getenv("SARVAM_API_KEY"), bot, sampleRate)
-	default:
-		return eleven.NewTTS("tts", os.Getenv("ELEVENLABS_API_KEY"), os.Getenv("ELEVENLABS_VOICE_ID"), bot, sampleRate)
-	}
 }

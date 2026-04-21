@@ -17,6 +17,7 @@ import (
 
 	"github.com/rohitdas13595/llmpipe/aggregate"
 	"github.com/rohitdas13595/llmpipe/audio/interrupt"
+	"github.com/rohitdas13595/llmpipe/audio/turn"
 	"github.com/rohitdas13595/llmpipe/audio/vad"
 	ex "github.com/rohitdas13595/llmpipe/examples"
 	"github.com/rohitdas13595/llmpipe/frames"
@@ -24,19 +25,12 @@ import (
 	"github.com/rohitdas13595/llmpipe/pipeline"
 	"github.com/rohitdas13595/llmpipe/processor"
 	"github.com/rohitdas13595/llmpipe/processors/idle"
-	"github.com/rohitdas13595/llmpipe/services"
-	"github.com/rohitdas13595/llmpipe/services/aws"
-	"github.com/rohitdas13595/llmpipe/services/deepgram"
-	eleven "github.com/rohitdas13595/llmpipe/services/elevenlabs"
-	googlesvc "github.com/rohitdas13595/llmpipe/services/google"
-	"github.com/rohitdas13595/llmpipe/services/openai"
-	"github.com/rohitdas13595/llmpipe/services/sarvam"
+	"github.com/rohitdas13595/llmpipe/providers"
 	lktransport "github.com/rohitdas13595/llmpipe/transport/livekit"
 
 	"github.com/livekit/protocol/auth"
 	protoLogger "github.com/livekit/protocol/logger"
 	lksdk "github.com/livekit/server-sdk-go/v2"
-	"google.golang.org/genai"
 
 	"github.com/joho/godotenv"
 )
@@ -47,9 +41,9 @@ func main() {
 	protoLogger.InitFromConfig(&protoLogger.Config{Level: "warn"}, "voicebot-livekit")
 	lksdk.SetLogger(protoLogger.GetLogger())
 
-	url := envOr("LIVEKIT_URL", "ws://localhost:7880")
-	room := envOr("LIVEKIT_ROOM", "demo")
-	identity := envOr("LIVEKIT_IDENTITY", "llmpipe-agent")
+	url := providers.EnvOr("LIVEKIT_URL", "ws://localhost:7880")
+	room := providers.EnvOr("LIVEKIT_ROOM", "demo")
+	identity := providers.EnvOr("LIVEKIT_IDENTITY", "llmpipe-agent")
 	apiKey := os.Getenv("LIVEKIT_API_KEY")
 	apiSecret := os.Getenv("LIVEKIT_API_SECRET")
 	if apiKey == "" || apiSecret == "" {
@@ -71,14 +65,15 @@ func main() {
 		}
 	}
 
-	llmBackend := strings.ToLower(envOr("LLM", "openai"))
+	llmBackend := strings.ToLower(providers.EnvOr("LLM", "openai"))
 	if llmBackend == "gemini" {
 		llmBackend = "google"
 	}
-	sttBackend := strings.ToLower(envOr("STT", "deepgram"))
-	ttsBackend := strings.ToLower(envOr("TTS", "elevenlabs"))
+	sttBackend := strings.ToLower(providers.EnvOr("STT", "deepgram"))
+	ttsBackend := strings.ToLower(providers.EnvOr("TTS", "elevenlabs"))
+	pipeMode := providers.PipelineMode()
 
-	ctxLLM := aggregate.NewLLMContext(envOr("SYSTEM_PROMPT", "You are a concise voice assistant."))
+	ctxLLM := aggregate.NewLLMContext(providers.EnvOr("SYSTEM_PROMPT", "You are a concise voice assistant."))
 	bot := aggregate.NewBotState()
 	strategy := interrupt.MinWords{N: 1}
 
@@ -101,10 +96,6 @@ func main() {
 		return task.ReenterAfter(ctx, name, f)
 	}
 
-	stt := buildSTT(sttBackend, reenter, sampleRate, bot)
-	llm := buildLLM(llmBackend, reenter, ctxLLM)
-	tts := buildTTS(ttsBackend, bot, sampleRate)
-
 	userAgg := aggregate.NewUserAggregator("user.agg", ctxLLM, bot, strategy)
 	asst := aggregate.NewAssistantAggregator("assistant", ctxLLM)
 	vadTh := 120.0
@@ -113,7 +104,14 @@ func main() {
 			vadTh = f
 		}
 	}
-	vadP := vad.NewProcessor("vad", vad.NewEnergyAnalyzer(vadTh, envIntOr("VAD_MIN_SPEECH", 2), envIntOr("VAD_MIN_SILENCE", 6)))
+	vadAna := vad.NewEnergyAnalyzer(vadTh, envIntOr("VAD_MIN_SPEECH", 2), envIntOr("VAD_MIN_SILENCE", 6))
+	if v := os.Getenv("TURN_SILENCE_MS"); v != "" {
+		if ms, err := strconv.ParseFloat(v, 64); err == nil && ms > 0 {
+			vadAna.SilenceStopMS = ms
+			log.Printf("VAD: TURN_SILENCE_MS=%.0f (time-based end-of-user-turn)", ms)
+		}
+	}
+	vadP := vad.NewProcessor("vad", vadAna)
 
 	userIdle := idle.NewUserProcessor("user.idle", time.Minute, func(retry int) bool {
 		endPipeline(fmt.Sprintf("user idle 1m — pipeline task only, demo/LiveKit process keeps running (retry=%d)", retry))
@@ -132,16 +130,44 @@ func main() {
 		return task.QueueFrames(ctx, ff)
 	}, protoLogger.GetLogger(), lktransport.ConnectOptionsFromEnv()...)
 
-	procs := []processor.Processor{
-		userIdle,
-		tr.Input(),
-		vadP,
-		stt,
-		userAgg,
-		llm,
-		asst,
-		tts,
-		tr.Output(),
+	var procs []processor.Processor
+	switch pipeMode {
+	case "gemini_live", "google_live":
+		log.Printf("PIPELINE=%s — Gemini Live (Pipecat google/gemini_live)", pipeMode)
+		procs = []processor.Processor{
+			userIdle,
+			tr.Input(),
+			providers.BuildGeminiLive(reenter, bot, providers.EnvOr("SYSTEM_PROMPT", "")),
+			tr.Output(),
+		}
+	case "openai_realtime":
+		log.Printf("PIPELINE=openai_realtime (Pipecat openai/realtime)")
+		procs = []processor.Processor{
+			userIdle,
+			tr.Input(),
+			providers.BuildOpenAIRealtime(reenter, bot, providers.EnvOr("SYSTEM_PROMPT", "")),
+			tr.Output(),
+		}
+	default:
+		stt := providers.BuildSTT(sttBackend, reenter, sampleRate, bot)
+		llm := providers.BuildLLM(llmBackend, reenter, ctxLLM)
+		tts := providers.BuildTTS(ttsBackend, bot, sampleRate)
+		procs = []processor.Processor{
+			userIdle,
+			tr.Input(),
+			vadP,
+		}
+		if providers.EnvOr("TURN_TRACK", "1") != "0" {
+			procs = append(procs, turn.NewTrackingProcessor("turn"))
+		}
+		procs = append(procs,
+			stt,
+			userAgg,
+			llm,
+			asst,
+			tts,
+			tr.Output(),
+		)
 	}
 
 	p := pipeline.NewPipeline(procs...)
@@ -167,7 +193,7 @@ func main() {
 	}
 	defer tr.Disconnect()
 
-	log.Printf("llmpipe: livekit room joined room=%q agent=%q sampleRate=%d (Pion ICE/TURN lines are WebRTC, not frame pipeline; STT/LLM/TTS are silent unless they error)", room, identity, sampleRate)
+	log.Printf("llmpipe: livekit room joined room=%q agent=%q sampleRate=%d PIPELINE=%s", room, identity, sampleRate, pipeMode)
 
 	_ = task.QueueFrames(context.Background(), []frames.Frame{
 		&frames.StartFrame{SampleRate: sampleRate, NumChannels: 1},
@@ -233,13 +259,6 @@ func startLiveKitDemoServer(addr, livekitURL, defaultRoom, apiKey, apiSecret str
 	}
 }
 
-func envOr(k, def string) string {
-	if v := os.Getenv(k); v != "" {
-		return v
-	}
-	return def
-}
-
 func envIntOr(k string, def int) int {
 	if v := os.Getenv(k); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
@@ -247,51 +266,4 @@ func envIntOr(k string, def int) int {
 		}
 	}
 	return def
-}
-
-func buildSTT(backend string, re services.ReenterFunc, sampleRate int, bot *aggregate.BotState) processor.Processor {
-	switch backend {
-	case "google":
-		return googlesvc.NewSTT("stt", re)
-	case "aws":
-		return aws.NewSTT("stt", re)
-	case "sarvam":
-		return sarvam.NewSTT("stt", re)
-	default:
-		return deepgram.NewSTT("stt", os.Getenv("DEEPGRAM_API_KEY"), re, sampleRate, bot)
-	}
-}
-
-func buildLLM(backend string, re services.ReenterFunc, c *aggregate.LLMContext) processor.Processor {
-	switch backend {
-	case "google":
-		var cfg *genai.ClientConfig
-		if k := strings.TrimSpace(os.Getenv("GEMINI_API_KEY")); k != "" {
-			cfg = &genai.ClientConfig{APIKey: k}
-		} else if k := strings.TrimSpace(os.Getenv("GOOGLE_API_KEY")); k != "" {
-			cfg = &genai.ClientConfig{APIKey: k}
-		}
-		gc, err := genai.NewClient(context.Background(), cfg)
-		if err != nil {
-			log.Fatal("gemini client:", err)
-		}
-		model := envOr("GEMINI_MODEL", "gemini-2.0-flash")
-		log.Printf("LLM backend=google (Gemini) model=%q", model)
-		return googlesvc.NewLLM("llm", model, gc, c, re)
-	default:
-		return openai.NewLLM("llm", os.Getenv("OPENAI_API_KEY"), os.Getenv("OPENAI_MODEL"), c, re)
-	}
-}
-
-func buildTTS(backend string, bot *aggregate.BotState, sampleRate int) processor.Processor {
-	switch backend {
-	case "google":
-		return googlesvc.NewTTS("tts")
-	case "aws":
-		return aws.NewTTS("tts")
-	case "sarvam":
-		return sarvam.NewTTS("tts", os.Getenv("SARVAM_API_KEY"), bot, sampleRate)
-	default:
-		return eleven.NewTTS("tts", os.Getenv("ELEVENLABS_API_KEY"), os.Getenv("ELEVENLABS_VOICE_ID"), bot, sampleRate)
-	}
 }
