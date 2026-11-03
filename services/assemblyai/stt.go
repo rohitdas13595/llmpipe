@@ -17,8 +17,8 @@ import (
 	"time"
 
 	"github.com/rohitdas13595/llmpipe/aggregate"
-	"github.com/rohitdas13595/llmpipe/internal/audiofmt"
 	"github.com/rohitdas13595/llmpipe/frames"
+	"github.com/rohitdas13595/llmpipe/internal/audiofmt"
 	"github.com/rohitdas13595/llmpipe/processor"
 	"github.com/rohitdas13595/llmpipe/services"
 )
@@ -31,6 +31,7 @@ type STT struct {
 	Reenter    services.ReenterFunc
 	Bot        *aggregate.BotState
 
+	services.Slot
 	mu  sync.Mutex
 	buf bytes.Buffer
 }
@@ -43,6 +44,10 @@ func NewSTT(name, apiKey string, reenter services.ReenterFunc, sampleRate int, b
 }
 
 func (s *STT) Name() string { return s.name }
+
+func (s *STT) push(ctx context.Context, f frames.Frame) error {
+	return services.PushDown(ctx, s.H(), s.Reenter, s.name, f)
+}
 
 func (s *STT) Process(ctx context.Context, f frames.Frame, dir processor.Direction, emit processor.Emit) error {
 	switch fr := f.(type) {
@@ -66,7 +71,7 @@ func (s *STT) Process(ctx context.Context, f frames.Frame, dir processor.Directi
 			s.mu.Unlock()
 			return nil
 		}
-		go s.flush(context.Background())
+		go s.flush(s.ProcContext())
 	case *frames.InterimTranscriptionFrame:
 		emit.Down(f)
 	default:
@@ -95,11 +100,11 @@ func (s *STT) flush(ctx context.Context) {
 	pcm := append([]byte(nil), s.buf.Bytes()...)
 	s.buf.Reset()
 	s.mu.Unlock()
-	if s.Reenter == nil {
+	if s.H() == nil && s.Reenter == nil {
 		return
 	}
 	if strings.TrimSpace(s.APIKey) == "" {
-		_ = s.Reenter(ctx, s.name, &frames.ErrorFrame{Err: fmt.Errorf("assemblyai: set ASSEMBLYAI_API_KEY")})
+		_ = s.push(ctx, &frames.ErrorFrame{Err: fmt.Errorf("assemblyai: set ASSEMBLYAI_API_KEY")})
 		return
 	}
 	if !gate(pcm, s.SampleRate) {
@@ -109,24 +114,24 @@ func (s *STT) flush(ctx context.Context) {
 
 	uploadURL, err := s.upload(ctx, wav)
 	if err != nil {
-		_ = s.Reenter(ctx, s.name, &frames.ErrorFrame{Err: err})
+		_ = s.push(ctx, &frames.ErrorFrame{Err: err})
 		return
 	}
 	id, err := s.createTranscript(ctx, uploadURL)
 	if err != nil {
-		_ = s.Reenter(ctx, s.name, &frames.ErrorFrame{Err: err})
+		_ = s.push(ctx, &frames.ErrorFrame{Err: err})
 		return
 	}
 	text, err := s.poll(ctx, id)
 	if err != nil {
-		_ = s.Reenter(ctx, s.name, &frames.ErrorFrame{Err: err})
+		_ = s.push(ctx, &frames.ErrorFrame{Err: err})
 		return
 	}
 	if strings.TrimSpace(text) == "" {
 		return
 	}
 	services.PipelineLog("stt", "assemblyai transcript: %q", text)
-	_ = s.Reenter(ctx, s.name, &frames.TranscriptionFrame{Text: strings.TrimSpace(text)})
+	_ = s.push(ctx, &frames.TranscriptionFrame{Text: strings.TrimSpace(text)})
 }
 
 func (s *STT) upload(ctx context.Context, wav []byte) (string, error) {
@@ -140,7 +145,7 @@ func (s *STT) upload(ctx context.Context, wav []byte) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	body, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusOK {
 		return "", fmt.Errorf("assemblyai upload: %s: %s", resp.Status, string(body))
@@ -164,7 +169,7 @@ func (s *STT) createTranscript(ctx context.Context, audioURL string) (string, er
 	if err != nil {
 		return "", err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	body, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusOK {
 		return "", fmt.Errorf("assemblyai transcript create: %s: %s", resp.Status, string(body))
@@ -190,7 +195,7 @@ func (s *STT) poll(ctx context.Context, id string) (string, error) {
 			return "", err
 		}
 		body, _ := io.ReadAll(resp.Body)
-		resp.Body.Close()
+		_ = resp.Body.Close()
 		var ts transcriptStatus
 		if json.Unmarshal(body, &ts) != nil {
 			return "", fmt.Errorf("assemblyai: invalid poll json")

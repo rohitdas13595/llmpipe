@@ -11,12 +11,55 @@ import (
 	"github.com/rohitdas13595/llmpipe/processor"
 )
 
+func waitRunning(t *testing.T, task *PipelineTask, done <-chan error) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for !task.Running() {
+		if time.Now().After(deadline) {
+			t.Fatal("task did not start")
+		}
+		select {
+		case err := <-done:
+			t.Fatalf("task ended early: %v", err)
+		case <-time.After(time.Millisecond):
+		}
+	}
+}
+
+// runUntilEnd starts the task, runs send once the loops are up, then End.
+// Sends that queue at the head stay ordered with that End.
+func runUntilEnd(t *testing.T, task *PipelineTask, send func()) {
+	t.Helper()
+	done := make(chan error, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(func() {
+		cancel()
+		task.Cancel()
+	})
+	go func() { done <- task.Run(ctx) }()
+	waitRunning(t, task, done)
+	if send != nil {
+		send()
+	}
+	task.StopWhenDone()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("task: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("task timeout")
+	}
+}
+
 func TestQueueFramesChainsDownstream(t *testing.T) {
 	var order []string
 	a := processor.Func{
 		N: "a",
 		F: func(ctx context.Context, f frames.Frame, dir processor.Direction, emit processor.Emit) error {
-			order = append(order, "a")
+			if _, ok := f.(*frames.TextFrame); ok {
+				order = append(order, "a")
+			}
 			emit.Down(f)
 			return nil
 		},
@@ -24,29 +67,31 @@ func TestQueueFramesChainsDownstream(t *testing.T) {
 	b := processor.Func{
 		N: "b",
 		F: func(ctx context.Context, f frames.Frame, dir processor.Direction, emit processor.Emit) error {
-			order = append(order, "b")
+			if _, ok := f.(*frames.TextFrame); ok {
+				order = append(order, "b")
+			}
 			emit.Down(f)
 			return nil
 		},
 	}
-	p := NewPipeline(a, b)
-	task := NewPipelineTask(p)
-	ctx := context.Background()
-	if err := task.QueueFrames(ctx, []frames.Frame{&frames.TextFrame{Text: "x"}}); err != nil {
-		t.Fatal(err)
-	}
+	task := NewPipelineTask(NewPipeline(a, b))
+	runUntilEnd(t, task, func() {
+		if err := task.QueueFrames(context.Background(), []frames.Frame{&frames.TextFrame{Text: "x"}}); err != nil {
+			t.Fatal(err)
+		}
+	})
 	if len(order) != 2 || order[0] != "a" || order[1] != "b" {
 		t.Fatalf("order = %v", order)
 	}
 }
 
 func TestReenterAfterByName(t *testing.T) {
-	var saw string
+	saw := make(chan string, 1)
 	end := processor.Func{
 		N: "end",
 		F: func(ctx context.Context, f frames.Frame, dir processor.Direction, emit processor.Emit) error {
 			if tf, ok := f.(*frames.TextFrame); ok {
-				saw = tf.Text
+				saw <- tf.Text
 			}
 			return nil
 		},
@@ -57,14 +102,28 @@ func TestReenterAfterByName(t *testing.T) {
 			return nil
 		},
 	}
-	p := NewPipeline(mid, end)
-	task := NewPipelineTask(p)
-	ctx := context.Background()
+	task := NewPipelineTask(NewPipeline(mid, end))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- task.Run(ctx) }()
+	waitRunning(t, task, done)
 	if err := task.ReenterAfter(ctx, "mid", &frames.TextFrame{Text: "hi"}); err != nil {
 		t.Fatal(err)
 	}
-	if saw != "hi" {
-		t.Fatalf("expected hi, got %q", saw)
+	select {
+	case got := <-saw:
+		if got != "hi" {
+			t.Fatalf("expected hi, got %q", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("reenter timeout")
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("run did not return")
 	}
 }
 
@@ -84,15 +143,18 @@ func TestEmitUpstream(t *testing.T) {
 	p1 := processor.Func{
 		N: "p1",
 		F: func(ctx context.Context, f frames.Frame, dir processor.Direction, emit processor.Emit) error {
-			emit.Up(f)
+			if _, ok := f.(*frames.TextFrame); ok {
+				emit.Up(f)
+			}
 			return nil
 		},
 	}
-	p := NewPipeline(p0, p1)
-	task := NewPipelineTask(p)
-	if err := task.QueueFrames(context.Background(), []frames.Frame{&frames.TextFrame{Text: "x"}}); err != nil {
-		t.Fatal(err)
-	}
+	task := NewPipelineTask(NewPipeline(p0, p1))
+	runUntilEnd(t, task, func() {
+		if err := task.QueueFrames(context.Background(), []frames.Frame{&frames.TextFrame{Text: "x"}}); err != nil {
+			t.Fatal(err)
+		}
+	})
 	if !sawUpstream {
 		t.Fatal("expected upstream delivery at p0")
 	}
@@ -119,8 +181,7 @@ func TestReenterPastEndNoOp(t *testing.T) {
 			return nil
 		},
 	}
-	p := NewPipeline(only)
-	task := NewPipelineTask(p)
+	task := NewPipelineTask(NewPipeline(only))
 	if err := task.Reenter(context.Background(), 0, &frames.TextFrame{Text: "x"}); err != nil {
 		t.Fatal(err)
 	}
@@ -130,10 +191,13 @@ func TestReenterPastEndNoOp(t *testing.T) {
 }
 
 func TestProcessorIndex(t *testing.T) {
-	a := processor.Func{N: "dup", F: func(ctx context.Context, f frames.Frame, dir processor.Direction, emit processor.Emit) error { return nil }}
-	b := processor.Func{N: "dup", F: func(ctx context.Context, f frames.Frame, dir processor.Direction, emit processor.Emit) error { return nil }}
-	p := NewPipeline(a, b)
-	task := NewPipelineTask(p)
+	a := processor.Func{N: "dup", F: func(ctx context.Context, f frames.Frame, dir processor.Direction, emit processor.Emit) error {
+		return nil
+	}}
+	b := processor.Func{N: "dup", F: func(ctx context.Context, f frames.Frame, dir processor.Direction, emit processor.Emit) error {
+		return nil
+	}}
+	task := NewPipelineTask(NewPipeline(a, b))
 	if task.ProcessorIndex("dup") != 0 {
 		t.Fatalf("first dup index = %d", task.ProcessorIndex("dup"))
 	}
@@ -147,31 +211,62 @@ func TestQueueFramesPropagatesProcessError(t *testing.T) {
 	bad := processor.Func{
 		N: "bad",
 		F: func(ctx context.Context, f frames.Frame, dir processor.Direction, emit processor.Emit) error {
+			if _, ok := f.(*frames.EndFrame); ok {
+				return nil
+			}
 			return want
 		},
 	}
-	p := NewPipeline(bad)
-	task := NewPipelineTask(p)
-	err := task.QueueFrames(context.Background(), []frames.Frame{&frames.TextFrame{}})
-	if err != want {
-		t.Fatalf("err = %v, want %v", err, want)
+	errCh := make(chan error, 1)
+	task := NewPipelineTask(NewPipeline(bad), WithOnError(func(err error) {
+		select {
+		case errCh <- err:
+		default:
+		}
+	}))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- task.Run(ctx) }()
+	waitRunning(t, task, done)
+	if err := task.QueueFrames(context.Background(), []frames.Frame{&frames.TextFrame{}}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-errCh:
+		if err != want {
+			t.Fatalf("err = %v, want %v", err, want)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("error was not delivered upstream")
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("run did not return")
 	}
 }
 
 func TestWithObserversNotified(t *testing.T) {
 	var last observe.FramePushed
-	o := observe.FuncObserver{F: func(p observe.FramePushed) { last = p }}
+	o := observe.FuncObserver{F: func(p observe.FramePushed) {
+		if _, ok := p.Frame.(*frames.TextFrame); ok {
+			last = p
+		}
+	}}
 	rec := processor.Func{
 		N: "rec",
 		F: func(ctx context.Context, f frames.Frame, dir processor.Direction, emit processor.Emit) error {
 			return nil
 		},
 	}
-	p := NewPipeline(rec)
-	task := NewPipelineTask(p, WithObservers(o))
-	if err := task.QueueFrames(context.Background(), []frames.Frame{&frames.TextFrame{Text: "z"}}); err != nil {
-		t.Fatal(err)
-	}
+	task := NewPipelineTask(NewPipeline(rec), WithObservers(o))
+	runUntilEnd(t, task, func() {
+		if err := task.QueueFrames(context.Background(), []frames.Frame{&frames.TextFrame{Text: "z"}}); err != nil {
+			t.Fatal(err)
+		}
+	})
 	if last.Processor != "rec" || last.Index != 0 {
 		t.Fatalf("observer: %+v", last)
 	}
@@ -182,7 +277,7 @@ func TestWithObserversNotified(t *testing.T) {
 
 func TestStartSession(t *testing.T) {
 	var saw int
-	p := NewPipeline(processor.Func{
+	task := NewPipelineTask(NewPipeline(processor.Func{
 		N: "x",
 		F: func(ctx context.Context, f frames.Frame, dir processor.Direction, emit processor.Emit) error {
 			if _, ok := f.(*frames.StartFrame); ok {
@@ -190,8 +285,12 @@ func TestStartSession(t *testing.T) {
 			}
 			return nil
 		},
-	})
-	task := NewPipelineTask(p)
+	}))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- task.Run(ctx) }()
+	waitRunning(t, task, done)
 	sf := &frames.StartFrame{SampleRate: 16000, NumChannels: 1}
 	if err := task.StartSession(context.Background(), sf); err != nil {
 		t.Fatal(err)
@@ -199,14 +298,19 @@ func TestStartSession(t *testing.T) {
 	if saw != 1 {
 		t.Fatalf("StartSession: saw=%d", saw)
 	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("run did not return")
+	}
 }
 
 func TestRunUntilCancel(t *testing.T) {
-	p := NewPipeline(processor.Func{N: "noop", F: func(ctx context.Context, f frames.Frame, dir processor.Direction, emit processor.Emit) error {
+	task := NewPipelineTask(NewPipeline(processor.Func{N: "noop", F: func(ctx context.Context, f frames.Frame, dir processor.Direction, emit processor.Emit) error {
 		emit.Down(f)
 		return nil
-	}})
-	task := NewPipelineTask(p)
+	}}))
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() { done <- task.Run(ctx) }()
@@ -222,8 +326,9 @@ func TestRunUntilCancel(t *testing.T) {
 }
 
 func TestCancelIdempotent(t *testing.T) {
-	p := NewPipeline(processor.Func{N: "noop", F: func(ctx context.Context, f frames.Frame, dir processor.Direction, emit processor.Emit) error { return nil }})
-	task := NewPipelineTask(p)
+	task := NewPipelineTask(NewPipeline(processor.Func{N: "noop", F: func(ctx context.Context, f frames.Frame, dir processor.Direction, emit processor.Emit) error {
+		return nil
+	}}))
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	_ = task.Run(ctx)
@@ -242,14 +347,15 @@ func TestQueueFramesMultipleFramesOrder(t *testing.T) {
 			return nil
 		},
 	}
-	p := NewPipeline(a)
-	task := NewPipelineTask(p)
-	if err := task.QueueFrames(context.Background(), []frames.Frame{
-		&frames.TextFrame{Text: "1"},
-		&frames.TextFrame{Text: "2"},
-	}); err != nil {
-		t.Fatal(err)
-	}
+	task := NewPipelineTask(NewPipeline(a))
+	runUntilEnd(t, task, func() {
+		if err := task.QueueFrames(context.Background(), []frames.Frame{
+			&frames.TextFrame{Text: "1"},
+			&frames.TextFrame{Text: "2"},
+		}); err != nil {
+			t.Fatal(err)
+		}
+	})
 	if len(got) != 2 || got[0] != "1" || got[1] != "2" {
 		t.Fatalf("got %v", got)
 	}

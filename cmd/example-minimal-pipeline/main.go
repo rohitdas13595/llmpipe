@@ -38,7 +38,13 @@ func main() {
 		}
 	}}))
 
+	done := make(chan error, 1)
+	go func() { done <- task.Run(ctx) }()
 	if err := task.QueueFrames(ctx, []frames.Frame{&frames.TextFrame{Text: "hello, llmpipe"}}); err != nil {
+		log.Fatal(err)
+	}
+	task.StopWhenDone()
+	if err := <-done; err != nil {
 		log.Fatal(err)
 	}
 	fmt.Println("observer last text:", last)

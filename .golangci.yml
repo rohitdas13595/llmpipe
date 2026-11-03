@@ -1,0 +1,50 @@
+version: "2"
+
+run:
+  timeout: 5m
+
+linters:
+  enable:
+    - govet
+    - staticcheck
+    - errcheck
+    - gocritic
+    - revive
+    - bodyclose
+    - noctx
+    # contextcheck is intentionally off: queue and service APIs use a detached
+    # context when the caller has no parent (pre-Run enqueue, turn work, tests).
+    # The linter treats every context.Background fallback as a defect.
+    - gosec
+
+  settings:
+    govet:
+      enable:
+        - copylocks
+    gosec:
+      includes:
+        - G304
+        - G401
+        - G404
+        - G501
+    revive:
+      rules:
+        - name: exported
+          disabled: true
+        - name: package-comments
+          disabled: true
+        - name: unused-parameter
+          disabled: true
+
+  exclusions:
+    generated: lax
+    paths:
+      - serializers/pipecatpb
+    rules:
+      - linters:
+          - errcheck
+          - gosec
+        path: _test\.go
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0

@@ -45,6 +45,7 @@ func GenaiClient(ctx context.Context) (*genai.Client, error) {
 }
 
 // BuildSTT maps STT= env to processors (Pipecat: deepgram/stt, google/stt, openai/stt, groq/stt, assemblyai, …).
+// re is deprecated and ignored once the task calls Setup; pass nil.
 func BuildSTT(backend string, re services.ReenterFunc, sampleRate int, bot *aggregate.BotState) processor.Processor {
 	b := strings.ToLower(strings.TrimSpace(backend))
 	switch b {
@@ -83,6 +84,7 @@ func BuildSTT(backend string, re services.ReenterFunc, sampleRate int, bot *aggr
 }
 
 // BuildLLM maps LLM= (Pipecat: openai/llm, google/llm, anthropic/llm, groq/llm, together, … — see tryLLMOpenAICompat).
+// re is deprecated and ignored once the task calls Setup; pass nil.
 func BuildLLM(backend string, re services.ReenterFunc, ctxLLM *aggregate.LLMContext) processor.Processor {
 	b := strings.ToLower(strings.TrimSpace(backend))
 	if b == "gemini" {

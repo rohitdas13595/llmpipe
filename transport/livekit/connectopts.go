@@ -28,8 +28,7 @@ func ConnectOptionsFromEnv() []lksdk.ConnectOption {
 		opts = append(opts, lksdk.WithDisableRegionDiscovery())
 	}
 
-	switch strings.ToLower(strings.TrimSpace(os.Getenv("LIVEKIT_ICE_TRANSPORT"))) {
-	case "relay":
+	if strings.EqualFold(strings.TrimSpace(os.Getenv("LIVEKIT_ICE_TRANSPORT")), "relay") {
 		opts = append(opts, lksdk.WithICETransportPolicy(webrtc.ICETransportPolicyRelay))
 	}
 

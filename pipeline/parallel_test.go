@@ -3,6 +3,7 @@ package pipeline
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/rohitdas13595/llmpipe/frames"
 	"github.com/rohitdas13595/llmpipe/processor"
@@ -37,9 +38,11 @@ func TestParallelPipelineSingleBranch(t *testing.T) {
 		},
 	)
 	task := NewPipelineTask(p)
-	if err := task.QueueFrames(context.Background(), []frames.Frame{&frames.TextFrame{Text: "hi"}}); err != nil {
-		t.Fatal(err)
-	}
+	runUntilEnd(t, task, func() {
+		if err := task.QueueFrames(context.Background(), []frames.Frame{&frames.TextFrame{Text: "hi"}}); err != nil {
+			t.Fatal(err)
+		}
+	})
 	if len(got) != 1 || got[0] != "hi" {
 		t.Fatalf("got %v", got)
 	}
@@ -54,15 +57,20 @@ func TestParallelPipelineDedupesSamePointer(t *testing.T) {
 	p := NewPipeline(pp, processor.Func{
 		N: "sink",
 		F: func(ctx context.Context, f frames.Frame, dir processor.Direction, emit processor.Emit) error {
+			if _, ok := f.(*frames.EndFrame); ok {
+				return nil
+			}
 			got = append(got, f)
 			return nil
 		},
 	})
 	task := NewPipelineTask(p)
 	tf := &frames.TextFrame{Text: "once"}
-	if err := task.QueueFrames(context.Background(), []frames.Frame{tf}); err != nil {
-		t.Fatal(err)
-	}
+	runUntilEnd(t, task, func() {
+		if err := task.QueueFrames(context.Background(), []frames.Frame{tf}); err != nil {
+			t.Fatal(err)
+		}
+	})
 	if len(got) != 1 {
 		t.Fatalf("expected 1 frame after dedup, got %d", len(got))
 	}
@@ -88,42 +96,60 @@ func TestParallelPipelineStartFrameOrder(t *testing.T) {
 		[]processor.Processor{emitOnStart},
 		[]processor.Processor{identity("id")},
 	)
-	var kinds []string
+	kinds := make(chan string, 8)
 	p := NewPipeline(pp, processor.Func{
 		N: "sink",
 		F: func(ctx context.Context, f frames.Frame, dir processor.Direction, emit processor.Emit) error {
-			kinds = append(kinds, f.FrameKind())
+			if _, ok := f.(*frames.EndFrame); ok {
+				return nil
+			}
+			kinds <- f.FrameKind()
 			return nil
 		},
 	})
 	task := NewPipelineTask(p)
-	if err := task.QueueFrames(context.Background(), []frames.Frame{
-		&frames.TextFrame{Text: "hello"},
-		&frames.StartFrame{SampleRate: 16000, NumChannels: 1},
-	}); err != nil {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- task.Run(ctx) }()
+	waitRunning(t, task, done)
+	// Data is queued first and observed before Start. Start is system priority,
+	// so it would otherwise pass data still sitting in an inbox.
+	if err := task.QueueFrames(context.Background(), []frames.Frame{&frames.TextFrame{Text: "hello"}}); err != nil {
 		t.Fatal(err)
 	}
-	// First queued frame: TextFrame (data) — parallel emits one TextFrame
-	// Second: StartFrame sync — Start, then Text from start
-	if len(kinds) < 2 {
-		t.Fatalf("kinds: %v", kinds)
+	select {
+	case k := <-kinds:
+		if k != frames.KindText {
+			t.Fatalf("first frame kind %q", k)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for text")
 	}
-	if kinds[0] != frames.KindText {
-		t.Fatalf("first frame kind %q", kinds[0])
+	if err := task.QueueFrame(context.Background(), &frames.StartFrame{SampleRate: 16000, NumChannels: 1}); err != nil {
+		t.Fatal(err)
 	}
-	// Find Start sequence
-	var startIdx int = -1
-	for i, k := range kinds {
-		if k == frames.KindStart {
-			startIdx = i
-			break
+	var rest []string
+	timeout := time.After(2 * time.Second)
+	for len(rest) < 2 {
+		select {
+		case k := <-kinds:
+			rest = append(rest, k)
+		case <-timeout:
+			t.Fatalf("timeout, rest=%v", rest)
 		}
 	}
-	if startIdx < 0 {
-		t.Fatalf("no StartFrame in %v", kinds)
+	task.StopWhenDone()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("task timeout")
 	}
-	if startIdx+1 >= len(kinds) || kinds[startIdx+1] != frames.KindText {
-		t.Fatalf("expected Text after Start, got %v", kinds[startIdx:])
+	if rest[0] != frames.KindStart || rest[1] != frames.KindText {
+		t.Fatalf("after text, got %v", rest)
 	}
 }
 
@@ -159,9 +185,11 @@ func TestParallelPipelineUpstreamUsesBranch0(t *testing.T) {
 	pp := MustParallelPipeline("par", []processor.Processor{p0, p1})
 	p := NewPipeline(pp)
 	task := NewPipelineTask(p)
-	if err := task.QueueFrames(context.Background(), []frames.Frame{&frames.TextFrame{Text: "up"}}); err != nil {
-		t.Fatal(err)
-	}
+	runUntilEnd(t, task, func() {
+		if err := task.QueueFrames(context.Background(), []frames.Frame{&frames.TextFrame{Text: "up"}}); err != nil {
+			t.Fatal(err)
+		}
+	})
 	if saw != "up" {
 		t.Fatalf("upstream: %q", saw)
 	}

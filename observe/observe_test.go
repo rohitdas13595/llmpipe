@@ -21,7 +21,7 @@ func TestIdleFrameObserverFiresWithoutReset(t *testing.T) {
 	cfg := IdleConfig{
 		Timeout:    60 * time.Millisecond,
 		ResetKinds: map[string]struct{}{},
-		OnIdle: func() { close(done) },
+		OnIdle:     func() { close(done) },
 	}
 	i := NewIdleFrameObserver(cfg)
 	i.Start()

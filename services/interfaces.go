@@ -24,4 +24,8 @@ type TTS interface {
 }
 
 // ReenterFunc injects frames downstream after the named processor finishes async work.
+//
+// Retained until v0.4. New code should use processor.Handle from Setup
+// (PushFrame / PushFrameCtx). Constructors still accept this so existing
+// callers compile; a live Handle takes precedence and this callback is not used.
 type ReenterFunc func(ctx context.Context, afterProcessorName string, f frames.Frame) error

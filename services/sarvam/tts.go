@@ -28,6 +28,7 @@ type TTS struct {
 	SampleRate int
 	Bot        *aggregate.BotState
 
+	services.Slot
 	mu         sync.Mutex
 	canceling  bool
 	textBuffer strings.Builder
@@ -51,8 +52,24 @@ func (t *TTS) Process(ctx context.Context, f frames.Frame, dir processor.Directi
 		t.mu.Unlock()
 		emit.Down(f)
 	case *frames.LLMFullResponseEndFrame:
-		t.flushBufferedText(ctx, emit)
-		emit.Down(f)
+		t.mu.Lock()
+		text := strings.TrimSpace(t.textBuffer.String())
+		t.textBuffer.Reset()
+		canceling := t.canceling
+		t.mu.Unlock()
+		synth := func(ctx context.Context, emit processor.Emit) {
+			t.speak(ctx, emit, text, canceling)
+			emit.Down(f)
+		}
+		if h := t.H(); h != nil {
+			turn := h.TurnContext()
+			go synth(turn, processor.Emit{Down: func(ff frames.Frame) {
+				_ = h.PushFrameCtx(turn, ff, processor.Downstream)
+			}})
+			return nil
+		}
+		synth(ctx, emit)
+		return nil
 	case *frames.InterruptionFrame:
 		t.mu.Lock()
 		t.canceling = true
@@ -75,12 +92,7 @@ func (t *TTS) Process(ctx context.Context, f frames.Frame, dir processor.Directi
 	return nil
 }
 
-func (t *TTS) flushBufferedText(ctx context.Context, emit processor.Emit) {
-	t.mu.Lock()
-	text := strings.TrimSpace(t.textBuffer.String())
-	t.textBuffer.Reset()
-	canceling := t.canceling
-	t.mu.Unlock()
+func (t *TTS) speak(ctx context.Context, emit processor.Emit, text string, canceling bool) {
 	if canceling || text == "" {
 		return
 	}
@@ -121,12 +133,12 @@ func (t *TTS) flushBufferedText(ctx context.Context, emit processor.Emit) {
 }
 
 type ttsRequest struct {
-	Text               string `json:"text"`
-	TargetLanguageCode string `json:"target_language_code"`
-	Speaker            string `json:"speaker,omitempty"`
-	Model              string `json:"model,omitempty"`
-	SpeechSampleRate   string `json:"speech_sample_rate,omitempty"`
-	OutputAudioCodec   string `json:"output_audio_codec,omitempty"`
+	Text               string   `json:"text"`
+	TargetLanguageCode string   `json:"target_language_code"`
+	Speaker            string   `json:"speaker,omitempty"`
+	Model              string   `json:"model,omitempty"`
+	SpeechSampleRate   string   `json:"speech_sample_rate,omitempty"`
+	OutputAudioCodec   string   `json:"output_audio_codec,omitempty"`
 	Pace               *float64 `json:"pace,omitempty"`
 }
 
@@ -179,7 +191,7 @@ func (t *TTS) synth(ctx context.Context, text string) ([]byte, int, error) {
 	if err != nil {
 		return nil, 0, err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	raw, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusOK {
 		var eb errBody

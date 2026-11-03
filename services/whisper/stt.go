@@ -40,6 +40,7 @@ type STT struct {
 	Reenter services.ReenterFunc
 	Bot     *aggregate.BotState
 
+	services.Slot
 	mu  sync.Mutex
 	buf bytes.Buffer
 }
@@ -55,6 +56,10 @@ func NewSTT(name string, cfg Config, reenter services.ReenterFunc, sampleRate in
 }
 
 func (s *STT) Name() string { return s.name }
+
+func (s *STT) push(ctx context.Context, f frames.Frame) error {
+	return services.PushDown(ctx, s.H(), s.Reenter, s.name, f)
+}
 
 func (s *STT) Process(ctx context.Context, f frames.Frame, dir processor.Direction, emit processor.Emit) error {
 	switch fr := f.(type) {
@@ -78,7 +83,7 @@ func (s *STT) Process(ctx context.Context, f frames.Frame, dir processor.Directi
 			s.mu.Unlock()
 			return nil
 		}
-		go s.flush(context.Background())
+		go s.flush(s.ProcContext())
 	case *frames.InterimTranscriptionFrame:
 		emit.Down(f)
 	default:
@@ -96,12 +101,12 @@ func (s *STT) flush(ctx context.Context) {
 	audio := append([]byte(nil), s.buf.Bytes()...)
 	s.buf.Reset()
 	s.mu.Unlock()
-	if s.Reenter == nil {
+	if s.H() == nil && s.Reenter == nil {
 		return
 	}
 	if strings.TrimSpace(s.cfg.APIKey) == "" {
 		services.PipelineLog("stt", "whisper: API key empty (OPENAI_API_KEY or GROQ_API_KEY)")
-		_ = s.Reenter(ctx, s.name, &frames.ErrorFrame{Err: fmt.Errorf("whisper: missing API key")})
+		_ = s.push(ctx, &frames.ErrorFrame{Err: fmt.Errorf("whisper: missing API key")})
 		return
 	}
 	if len(audio) == 0 {
@@ -129,7 +134,7 @@ func (s *STT) flush(ctx context.Context) {
 	}
 	fw, err := mp.CreateFormFile("file", "audio.wav")
 	if err != nil {
-		_ = s.Reenter(ctx, s.name, &frames.ErrorFrame{Err: err})
+		_ = s.push(ctx, &frames.ErrorFrame{Err: err})
 		return
 	}
 	_, _ = fw.Write(wav)
@@ -137,7 +142,7 @@ func (s *STT) flush(ctx context.Context) {
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u, &body)
 	if err != nil {
-		_ = s.Reenter(ctx, s.name, &frames.ErrorFrame{Err: err})
+		_ = s.push(ctx, &frames.ErrorFrame{Err: err})
 		return
 	}
 	req.Header.Set("Authorization", "Bearer "+s.cfg.APIKey)
@@ -147,13 +152,13 @@ func (s *STT) flush(ctx context.Context) {
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		services.PipelineLog("stt", "whisper: %v", err)
-		_ = s.Reenter(ctx, s.name, &frames.ErrorFrame{Err: err})
+		_ = s.push(ctx, &frames.ErrorFrame{Err: err})
 		return
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	raw, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusOK {
-		_ = s.Reenter(ctx, s.name, &frames.ErrorFrame{Err: fmt.Errorf("whisper: %s: %s", resp.Status, string(raw))})
+		_ = s.push(ctx, &frames.ErrorFrame{Err: fmt.Errorf("whisper: %s: %s", resp.Status, string(raw))})
 		return
 	}
 	var out transcribeResp
@@ -162,7 +167,7 @@ func (s *STT) flush(ctx context.Context) {
 		return
 	}
 	services.PipelineLog("stt", "whisper transcript: %q", out.Text)
-	_ = s.Reenter(ctx, s.name, &frames.TranscriptionFrame{Text: strings.TrimSpace(out.Text)})
+	_ = s.push(ctx, &frames.TranscriptionFrame{Text: strings.TrimSpace(out.Text)})
 }
 
 func pcmRMS16LE(pcm []byte) float64 {

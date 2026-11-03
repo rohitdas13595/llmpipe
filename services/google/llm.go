@@ -21,10 +21,9 @@ type LLM struct {
 	Ctx     *aggregate.LLMContext
 	Reenter services.ReenterFunc
 
-	mu        sync.Mutex
-	cancel    context.CancelFunc
-	activeGen int64
-	runGen    int64
+	services.Slot
+	mu     sync.Mutex
+	cancel context.CancelFunc
 }
 
 func NewLLM(name, model string, client *genai.Client, c *aggregate.LLMContext, re services.ReenterFunc) *LLM {
@@ -36,6 +35,10 @@ func NewLLM(name, model string, client *genai.Client, c *aggregate.LLMContext, r
 
 func (l *LLM) Name() string { return l.name }
 
+func (l *LLM) push(ctx context.Context, f frames.Frame) error {
+	return services.PushDown(ctx, l.H(), l.Reenter, l.name, f)
+}
+
 func (l *LLM) Process(ctx context.Context, f frames.Frame, dir processor.Direction, emit processor.Emit) error {
 	switch f.(type) {
 	case *frames.InterruptionFrame, *frames.CancelFrame:
@@ -44,42 +47,30 @@ func (l *LLM) Process(ctx context.Context, f frames.Frame, dir processor.Directi
 			l.cancel()
 			l.cancel = nil
 		}
-		l.runGen++
 		l.mu.Unlock()
 		emit.Down(f)
 	case *frames.LLMRunFrame:
-		if l.Client == nil || l.Reenter == nil {
-			emit.Down(&frames.ErrorFrame{Err: fmt.Errorf("google llm: client or Reenter nil")})
+		if l.Client == nil || (l.H() == nil && l.Reenter == nil) {
+			emit.Down(&frames.ErrorFrame{Err: fmt.Errorf("google llm: client or pipeline handle nil")})
 			return nil
 		}
 		services.PipelineLog("llm", "%s: LLMRunFrame → Gemini stream model=%q", l.name, l.Model)
-		go l.stream(context.Background())
+		go l.stream(l.TurnContext())
 	default:
 		emit.Down(f)
 	}
 	return nil
 }
 
-func (l *LLM) stream(bg context.Context) {
+func (l *LLM) stream(parent context.Context) {
 	l.mu.Lock()
-	l.runGen++
-	gen := l.runGen
 	if l.cancel != nil {
 		l.cancel()
 	}
-	ctx, cancel := context.WithCancel(bg)
+	ctx, cancel := context.WithCancel(parent)
 	l.cancel = cancel
-	l.activeGen = gen
 	l.mu.Unlock()
-
-	defer func() {
-		cancel()
-		l.mu.Lock()
-		if l.activeGen == gen {
-			l.cancel = nil
-		}
-		l.mu.Unlock()
-	}()
+	defer cancel()
 
 	msgs := l.Ctx.Snapshot()
 	var sys *genai.Content
@@ -103,7 +94,7 @@ func (l *LLM) stream(bg context.Context) {
 	}
 
 	services.PipelineLog("llm", "%s: GenerateContentStream model=%q contents=%d", l.name, l.Model, len(contents))
-	_ = l.Reenter(ctx, l.name, &frames.LLMFullResponseStartFrame{})
+	_ = l.push(ctx, &frames.LLMFullResponseStartFrame{})
 	stream := l.Client.Models.GenerateContentStream(ctx, l.Model, contents, cfg)
 	textChunks := 0
 	for resp, err := range stream {
@@ -113,7 +104,7 @@ func (l *LLM) stream(bg context.Context) {
 		}
 		if err != nil {
 			services.PipelineLog("llm", "%s: stream error: %v", l.name, err)
-			_ = l.Reenter(ctx, l.name, &frames.ErrorFrame{Err: err})
+			_ = l.push(ctx, &frames.ErrorFrame{Err: err})
 			break
 		}
 		if len(resp.Candidates) == 0 {
@@ -134,7 +125,7 @@ func (l *LLM) stream(bg context.Context) {
 				if p.Text == "" || p.Thought {
 					continue
 				}
-				_ = l.Reenter(ctx, l.name, &frames.LLMTextFrame{Text: p.Text})
+				_ = l.push(ctx, &frames.LLMTextFrame{Text: p.Text})
 				textChunks++
 			}
 		}
@@ -142,6 +133,6 @@ func (l *LLM) stream(bg context.Context) {
 	if textChunks == 0 {
 		services.PipelineLog("llm", "%s: no text tokens streamed (safety filter, thinking-only output, or API issue) — TTS will not run", l.name)
 	}
-	_ = l.Reenter(ctx, l.name, &frames.LLMFullResponseEndFrame{})
+	_ = l.push(ctx, &frames.LLMFullResponseEndFrame{})
 	services.PipelineLog("llm", "%s: stream finished (%d text chunks)", l.name, textChunks)
 }

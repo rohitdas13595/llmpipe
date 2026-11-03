@@ -136,7 +136,7 @@ func (c *Client) post(ctx context.Context, path string, jsonBody []byte, expectJ
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	raw, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return nil, fmt.Errorf("heygen %s: %s: %s", path, resp.Status, strings.TrimSpace(string(raw)))

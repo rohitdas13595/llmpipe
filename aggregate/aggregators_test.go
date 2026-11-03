@@ -7,6 +7,7 @@ import (
 	"github.com/rohitdas13595/llmpipe/audio/interrupt"
 	"github.com/rohitdas13595/llmpipe/frames"
 	"github.com/rohitdas13595/llmpipe/pipeline"
+	"github.com/rohitdas13595/llmpipe/pipeline/pipelinetest"
 	"github.com/rohitdas13595/llmpipe/processor"
 )
 
@@ -18,17 +19,22 @@ func TestUserAggregatorTranscriptionEmitsLLMRun(t *testing.T) {
 	tail := processor.Func{
 		N: "tail",
 		F: func(ctx context.Context, f frames.Frame, dir processor.Direction, emit processor.Emit) error {
+			if _, ok := f.(*frames.EndFrame); ok {
+				return nil
+			}
 			kinds = append(kinds, f.FrameKind())
 			return nil
 		},
 	}
 	p := pipeline.NewPipeline(u, tail)
 	task := pipeline.NewPipelineTask(p)
-	if err := task.QueueFrames(context.Background(), []frames.Frame{
-		&frames.TranscriptionFrame{Text: "hello"},
-	}); err != nil {
-		t.Fatal(err)
-	}
+	pipelinetest.UntilEnd(t, task, func() {
+		if err := task.QueueFrames(context.Background(), []frames.Frame{
+			&frames.TranscriptionFrame{Text: "hello"},
+		}); err != nil {
+			t.Fatal(err)
+		}
+	})
 	if len(kinds) != 1 || kinds[0] != frames.KindLLMRun {
 		t.Fatalf("kinds = %v", kinds)
 	}
@@ -45,17 +51,22 @@ func TestUserAggregatorEmptyTranscriptionNoLLMRun(t *testing.T) {
 	tail := processor.Func{
 		N: "tail",
 		F: func(ctx context.Context, f frames.Frame, dir processor.Direction, emit processor.Emit) error {
+			if _, ok := f.(*frames.EndFrame); ok {
+				return nil
+			}
 			kinds = append(kinds, f.FrameKind())
 			return nil
 		},
 	}
 	p := pipeline.NewPipeline(u, tail)
 	task := pipeline.NewPipelineTask(p)
-	if err := task.QueueFrames(context.Background(), []frames.Frame{
-		&frames.TranscriptionFrame{Text: "  "},
-	}); err != nil {
-		t.Fatal(err)
-	}
+	pipelinetest.UntilEnd(t, task, func() {
+		if err := task.QueueFrames(context.Background(), []frames.Frame{
+			&frames.TranscriptionFrame{Text: "  "},
+		}); err != nil {
+			t.Fatal(err)
+		}
+	})
 	if len(kinds) != 1 || kinds[0] != frames.KindTranscription {
 		t.Fatalf("kinds = %v", kinds)
 	}
@@ -76,14 +87,16 @@ func TestAssistantAggregatorStreamsTextAndCommits(t *testing.T) {
 	}
 	p := pipeline.NewPipeline(a, tail)
 	task := pipeline.NewPipelineTask(p)
-	if err := task.QueueFrames(context.Background(), []frames.Frame{
-		&frames.LLMFullResponseStartFrame{},
-		&frames.LLMTextFrame{Text: "he"},
-		&frames.LLMTextFrame{Text: "llo"},
-		&frames.LLMFullResponseEndFrame{},
-	}); err != nil {
-		t.Fatal(err)
-	}
+	pipelinetest.UntilEnd(t, task, func() {
+		if err := task.QueueFrames(context.Background(), []frames.Frame{
+			&frames.LLMFullResponseStartFrame{},
+			&frames.LLMTextFrame{Text: "he"},
+			&frames.LLMTextFrame{Text: "llo"},
+			&frames.LLMFullResponseEndFrame{},
+		}); err != nil {
+			t.Fatal(err)
+		}
+	})
 	if len(texts) != 2 || texts[0]+texts[1] != "hello" {
 		t.Fatalf("texts = %v", texts)
 	}

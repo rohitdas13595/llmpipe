@@ -10,6 +10,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -31,6 +32,8 @@ type Realtime struct {
 	Reenter      services.ReenterFunc
 	Bot          *aggregate.BotState
 
+	services.Slot
+	started    atomic.Bool
 	mu         sync.Mutex
 	conn       *websocket.Conn
 	recvCancel context.CancelFunc
@@ -50,6 +53,37 @@ func NewRealtime(name, apiKey, model, system string, re services.ReenterFunc, bo
 
 func (r *Realtime) Name() string { return r.name }
 
+func (r *Realtime) push(ctx context.Context, f frames.Frame) error {
+	return services.PushDown(ctx, r.H(), r.Reenter, r.name, f)
+}
+
+// Setup stores the pipeline handle and starts the realtime socket on the
+// processor context. The dial itself runs in the background so Setup does
+// not block the rest of the pipeline on the network.
+func (r *Realtime) Setup(ctx context.Context, h processor.Handle) error {
+	if err := r.Slot.Setup(ctx, h); err != nil {
+		return err
+	}
+	r.ensure(h.Context())
+	return nil
+}
+
+// Cleanup closes the realtime socket.
+func (r *Realtime) Cleanup(ctx context.Context) error {
+	r.closeConn()
+	return nil
+}
+
+func (r *Realtime) ensure(ctx context.Context) {
+	if strings.TrimSpace(r.APIKey) == "" || (r.H() == nil && r.Reenter == nil) {
+		return
+	}
+	if !r.started.CompareAndSwap(false, true) {
+		return
+	}
+	go r.connect(ctx)
+}
+
 func (r *Realtime) Process(ctx context.Context, f frames.Frame, dir processor.Direction, emit processor.Emit) error {
 	switch fr := f.(type) {
 	case *frames.StartFrame:
@@ -58,7 +92,11 @@ func (r *Realtime) Process(ctx context.Context, f frames.Frame, dir processor.Di
 			r.inRate = 16000
 		}
 		emit.Down(f)
-		go r.connect(context.Background())
+		parent := context.Background()
+		if h := r.H(); h != nil {
+			parent = h.Context()
+		}
+		r.ensure(parent)
 	case *frames.InputAudioRawFrame:
 		emit.Down(f)
 		r.mu.Lock()
@@ -91,7 +129,7 @@ func (r *Realtime) Process(ctx context.Context, f frames.Frame, dir processor.Di
 }
 
 func (r *Realtime) connect(bg context.Context) {
-	if strings.TrimSpace(r.APIKey) == "" || r.Reenter == nil {
+	if strings.TrimSpace(r.APIKey) == "" || (r.H() == nil && r.Reenter == nil) {
 		return
 	}
 	u, err := url.Parse("wss://api.openai.com/v1/realtime")
@@ -108,11 +146,15 @@ func (r *Realtime) connect(bg context.Context) {
 
 	ctx, cancel := context.WithCancel(bg)
 	d := websocket.Dialer{HandshakeTimeout: 30 * time.Second}
-	conn, _, err := d.DialContext(ctx, u.String(), hdr)
+	conn, resp, err := d.DialContext(ctx, u.String(), hdr)
+	if resp != nil && resp.Body != nil {
+		_ = resp.Body.Close()
+	}
 	if err != nil {
 		cancel()
+		r.started.Store(false)
 		services.PipelineLog("realtime", "openai dial: %v", err)
-		_ = r.Reenter(bg, r.name, &frames.ErrorFrame{Err: err})
+		_ = r.push(bg, &frames.ErrorFrame{Err: err})
 		return
 	}
 	r.mu.Lock()
@@ -172,22 +214,18 @@ func (r *Realtime) readLoop(ctx context.Context, conn *websocket.Conn) {
 			if r.Bot != nil {
 				r.Bot.SetSpeaking(true)
 			}
-			if r.Reenter != nil {
-				if first {
-					_ = r.Reenter(ctx, r.name, &frames.BotSpeakingFrame{})
-				}
-				_ = r.Reenter(ctx, r.name, &frames.TTSAudioRawFrame{
-					Audio: raw, SampleRate: openAIRealtimeInputRate, NumChannels: 1,
-				})
+			if first {
+				_ = r.push(ctx, &frames.BotSpeakingFrame{})
 			}
+			_ = r.push(ctx, &frames.TTSAudioRawFrame{
+				Audio: raw, SampleRate: openAIRealtimeInputRate, NumChannels: 1,
+			})
 		}
 		if typ == "response.output_audio.done" {
 			r.mu.Lock()
 			r.voiceOut = false
 			r.mu.Unlock()
-			if r.Reenter != nil {
-				_ = r.Reenter(ctx, r.name, &frames.BotStoppedSpeakingFrame{})
-			}
+			_ = r.push(ctx, &frames.BotStoppedSpeakingFrame{})
 			if r.Bot != nil {
 				r.Bot.SetSpeaking(false)
 			}

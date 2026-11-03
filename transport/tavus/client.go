@@ -82,7 +82,7 @@ func (c *Client) postConversation(ctx context.Context, payload []byte) (CreateCo
 	if err != nil {
 		return CreateConversationResponse{}, err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	b, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return CreateConversationResponse{}, fmt.Errorf("tavus: %s: %s", resp.Status, strings.TrimSpace(string(b)))
@@ -113,7 +113,7 @@ func (c *Client) EndConversation(ctx context.Context, conversationID string) err
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		b, _ := io.ReadAll(resp.Body)
 		return fmt.Errorf("tavus end: %s: %s", resp.Status, strings.TrimSpace(string(b)))
@@ -148,7 +148,7 @@ func (c *Client) GetPersona(ctx context.Context, personaID string) (Persona, err
 	if err != nil {
 		return Persona{}, err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	b, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return Persona{}, fmt.Errorf("tavus persona: %s: %s", resp.Status, strings.TrimSpace(string(b)))

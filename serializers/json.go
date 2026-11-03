@@ -14,12 +14,12 @@ import (
 type JSON struct{}
 
 type jsonEnvelope struct {
-	Kind        string          `json:"kind"`
-	Text        string          `json:"text,omitempty"`
-	AudioB64    string          `json:"audio_b64,omitempty"`
-	SampleRate  int             `json:"sample_rate,omitempty"`
-	NumChannels int             `json:"num_channels,omitempty"`
-	Data        string          `json:"data,omitempty"`
+	Kind        string `json:"kind"`
+	Text        string `json:"text,omitempty"`
+	AudioB64    string `json:"audio_b64,omitempty"`
+	SampleRate  int    `json:"sample_rate,omitempty"`
+	NumChannels int    `json:"num_channels,omitempty"`
+	Data        string `json:"data,omitempty"`
 	Index       int    `json:"index,omitempty"`
 	Complete    *bool  `json:"complete,omitempty"`
 }
