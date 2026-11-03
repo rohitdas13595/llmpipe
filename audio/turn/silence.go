@@ -1,5 +1,7 @@
 package turn
 
+import "context"
+
 // State is the end-of-utterance result (Pipecat: EndOfTurnState).
 type State int
 
@@ -57,3 +59,14 @@ func (s *SilenceAnalyzer) Reset() {
 	s.speechSeen = false
 	s.silenceMS = 0
 }
+
+// AnalyzeEndOfTurn reports the silence decision without consuming more audio.
+func (s *SilenceAnalyzer) AnalyzeEndOfTurn(context.Context) (Result, float32, error) {
+	if s.speechSeen && s.silenceMS >= s.StopMS {
+		return Complete, 1, nil
+	}
+	return Incomplete, 0, nil
+}
+
+// Clear drops the buffer. It is Reset.
+func (s *SilenceAnalyzer) Clear() { s.Reset() }

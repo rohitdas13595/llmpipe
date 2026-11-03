@@ -1,4 +1,4 @@
-// Command voicebot is a WebSocket PCM demo: input → VAD → STT → LLM → TTS → output,
+// Command voicebot is a WebSocket PCM demo: input → VAD → turns → STT → LLM → TTS → output,
 // or PIPELINE=gemini_live / openai_realtime (see ../pipecat Parity in docs/PROVIDERS.md).
 // Each WebSocket connection gets its own pipeline task.
 package main
@@ -20,7 +20,6 @@ import (
 	"github.com/rohitdas13595/llmpipe/aggregate"
 	"github.com/rohitdas13595/llmpipe/audio/interrupt"
 	"github.com/rohitdas13595/llmpipe/audio/turn"
-	"github.com/rohitdas13595/llmpipe/audio/vad"
 	"github.com/rohitdas13595/llmpipe/frames"
 	"github.com/rohitdas13595/llmpipe/observe"
 	"github.com/rohitdas13595/llmpipe/pipeline"
@@ -151,7 +150,8 @@ func runVoiceSession(root context.Context, sessions *sessionSet, w http.Response
 		procs = []processor.Processor{
 			userIdle,
 			tr.Input(),
-			vadProcessor(sampleRate),
+			providers.BuildVAD(sampleRate),
+			providers.BuildUserTurns(),
 		}
 		if providers.EnvOr("TURN_TRACK", "1") != "0" {
 			procs = append(procs, turn.NewTrackingProcessor("turn"))
@@ -205,31 +205,4 @@ func runVoiceSession(root context.Context, sessions *sessionSet, w http.Response
 	case <-time.After(25 * time.Second):
 		log.Println("pipeline cancel timed out")
 	}
-}
-
-func vadProcessor(sampleRate int) processor.Processor {
-	_ = sampleRate
-	vadTh := 120.0
-	if v := os.Getenv("VAD_RMS_THRESHOLD"); v != "" {
-		if f, err := strconv.ParseFloat(v, 64); err == nil && f > 0 {
-			vadTh = f
-		}
-	}
-	vadAna := vad.NewEnergyAnalyzer(vadTh, envIntOr("VAD_MIN_SPEECH", 2), envIntOr("VAD_MIN_SILENCE", 6))
-	if v := os.Getenv("TURN_SILENCE_MS"); v != "" {
-		if ms, err := strconv.ParseFloat(v, 64); err == nil && ms > 0 {
-			vadAna.SilenceStopMS = ms
-			log.Printf("VAD: TURN_SILENCE_MS=%.0f (time-based end-of-user-turn)", ms)
-		}
-	}
-	return vad.NewProcessor("vad", vadAna)
-}
-
-func envIntOr(k string, def int) int {
-	if v := os.Getenv(k); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 {
-			return n
-		}
-	}
-	return def
 }

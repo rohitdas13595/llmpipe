@@ -89,10 +89,16 @@ func (e *EnergyAnalyzer) Analyze(pcm16 []byte, sampleRate int) (started, stopped
 	return started, stopped
 }
 
-// Processor wraps an Analyzer and emits VAD / user speaking frames.
+// Processor wraps an Analyzer or a StateAnalyzer and emits VAD frames.
+// User speaking frames are left to turns.UserTurnProcessor. Set
+// LegacyEmitUserFrames to also emit UserStartedSpeaking / UserStoppedSpeaking,
+// which is the pre-phase-4 behaviour.
 type Processor struct {
 	name     string
 	analyzer Analyzer
+	state    *StateAnalyzer
+	// LegacyEmitUserFrames also emits user speaking frames. Default false.
+	LegacyEmitUserFrames bool
 }
 
 func NewProcessor(name string, a Analyzer) *Processor {
@@ -101,6 +107,11 @@ func NewProcessor(name string, a Analyzer) *Processor {
 		a = NewEnergyAnalyzer(120, 2, 6)
 	}
 	return &Processor{name: name, analyzer: a}
+}
+
+// NewStateProcessor emits VAD frames from the Pipecat-style state machine.
+func NewStateProcessor(name string, s *StateAnalyzer) *Processor {
+	return &Processor{name: name, state: s}
 }
 
 func (p *Processor) Name() string { return p.name }
@@ -112,19 +123,42 @@ func (p *Processor) Process(ctx context.Context, f frames.Frame, dir processor.D
 	}
 	switch fr := f.(type) {
 	case *frames.InputAudioRawFrame:
-		st, sp := p.analyzer.Analyze(fr.Audio, fr.SampleRate)
+		st, sp := p.analyze(fr)
 		if st {
-			emit.Down(&frames.VADUserStartedSpeakingFrame{})
-			emit.Down(&frames.UserStartedSpeakingFrame{})
+			if emit.Down != nil {
+				emit.Down(&frames.VADUserStartedSpeakingFrame{})
+			}
+			if p.LegacyEmitUserFrames && emit.Down != nil {
+				emit.Down(&frames.UserStartedSpeakingFrame{})
+			}
 		}
-		// Forward PCM before UserStoppedSpeaking so STT buffer includes this chunk before flush runs.
-		emit.Down(f)
+		// Forward PCM before the stop frame so a downstream STT buffer includes
+		// this chunk before a flush runs.
+		if emit.Down != nil {
+			emit.Down(f)
+		}
 		if sp {
-			emit.Down(&frames.VADUserStoppedSpeakingFrame{})
-			emit.Down(&frames.UserStoppedSpeakingFrame{})
+			if emit.Down != nil {
+				emit.Down(&frames.VADUserStoppedSpeakingFrame{})
+			}
+			if p.LegacyEmitUserFrames && emit.Down != nil {
+				emit.Down(&frames.UserStoppedSpeakingFrame{})
+			}
 		}
 	default:
-		emit.Down(f)
+		if emit.Down != nil {
+			emit.Down(f)
+		}
 	}
 	return nil
+}
+
+func (p *Processor) analyze(fr *frames.InputAudioRawFrame) (started, stopped bool) {
+	if p.state != nil {
+		return p.state.Analyze(fr.Audio, fr.SampleRate)
+	}
+	if p.analyzer == nil {
+		return false, false
+	}
+	return p.analyzer.Analyze(fr.Audio, fr.SampleRate)
 }

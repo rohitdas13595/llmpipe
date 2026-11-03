@@ -18,19 +18,20 @@ flowchart LR
   subgraph pipeline [Pipeline processors]
     P0[transport.input]
     P1[vad]
-    P2[stt]
-    P3[user.agg]
-    P4[llm]
-    P5[assistant]
+    P2[turns]
+    P3[stt]
+    P4[user]
+    P5[llm]
     P6[tts]
     P7[transport.output]
+    P8[assistant]
   end
-  P0 --> P1 --> P2 --> P3 --> P4 --> P5 --> P6 --> P7
+  P0 --> P1 --> P2 --> P3 --> P4 --> P5 --> P6 --> P7 --> P8
 ```
 
 Typical **voicebot** order (as in `cmd/voicebot/main.go`):
 
-`userIdle` → `ws.input` → `vad` → `stt` → `userAgg` → `llm` → `assistant` → `tts` → `ws.output`
+`userIdle` → `ws.input` → `vad` → `turns` → `stt` → `userAgg` → `llm` → `tts` → `ws.output` → `assistant`
 
 ---
 
@@ -56,9 +57,13 @@ Typical **voicebot** order (as in `cmd/voicebot/main.go`):
 | `github.com/rohitdas13595/llmpipe/transport/lemonslice` | LemonSlice session REST |
 | `github.com/rohitdas13595/llmpipe/transport/heygen` | HeyGen interactive streaming REST (`streaming.new` / `start` / `stop`) |
 | `github.com/rohitdas13595/llmpipe/transport/smallwebrtc` | `NewPeerConnection` ICE helper (Pion) |
-| `github.com/rohitdas13595/llmpipe/audio/vad` | VAD `Analyzer` + `Processor` |
+| `github.com/rohitdas13595/llmpipe/audio/vad` | Energy VAD, state machine, `Processor` |
+| `github.com/rohitdas13595/llmpipe/audio/vad/silero` | Silero VAD v5 (`-tags onnx`) |
+| `github.com/rohitdas13595/llmpipe/audio/onnx` | ONNX Runtime wrapper (`-tags onnx`) |
+| `github.com/rohitdas13595/llmpipe/turns` | User turn start / stop / mute |
 | `github.com/rohitdas13595/llmpipe/audio/interrupt` | Barge-in `Strategy` |
-| `github.com/rohitdas13595/llmpipe/audio/turn` | Placeholder for smart-turn / end-of-utterance |
+| `github.com/rohitdas13595/llmpipe/audio/turn` | `Analyzer`, silence fallback, turn tracking |
+| `github.com/rohitdas13595/llmpipe/audio/turn/smartturn` | Smart Turn v3 features and ONNX model |
 | `github.com/rohitdas13595/llmpipe/processors/idle` | User idle timer processor |
 | `github.com/rohitdas13595/llmpipe/processors/tools` | Reserved for tool/function-call wiring |
 | `github.com/rohitdas13595/llmpipe/services/*` | Provider-specific STT/LLM/TTS processors |
@@ -230,8 +235,9 @@ Atomic flag: is the bot currently speaking? Used for **echo suppression** (STT i
 
 ### `UserAggregator`
 
-- On **`InterimTranscriptionFrame`**: optional interrupt via strategy; forwards frame.
-- On **`TranscriptionFrame`**: appends user text to `LLMContext`, emits **`LLMRunFrame`** downstream.
+- On **`InterimTranscriptionFrame`**: forwards the frame. Barge-in is not decided here.
+- On **`UserStartedSpeakingFrame` / `UserStoppedSpeakingFrame`**: one user turn. VAD frames alone do not open it.
+- On **`TranscriptionFrame`**: appends user text to `LLMContext`, emits **`LLMRunFrame`** downstream after the turn (or immediately, outside one).
 
 ### `AssistantAggregator`
 
@@ -247,7 +253,10 @@ Atomic flag: is the bot currently speaking? Used for **echo suppression** (STT i
 
 - **`Analyzer`** — `Analyze(pcm16, sampleRate) (started, stopped bool)`.
 - **`EnergyAnalyzer`** — RMS threshold MVP (tunable threshold / min speech / silence **frames**). If **`SilenceStopMS` > 0**, end-of-speech uses **milliseconds** of sub-threshold audio after talk (Pipecat `stop_secs`–style); env **`TURN_SILENCE_MS`** in voicebot sets this.
-- **`Processor`** — on `InputAudioRawFrame`, emits VAD/user start/stop frames and forwards PCM.
+- **`StateAnalyzer`** — Quiet / Starting / Speaking / Stopping over a `Model`, with confidence, start, stop, and minimum-volume gates.
+- **`EnergyModel`** — RMS `Model` used when Silero is not linked.
+- **`Processor`** — on `InputAudioRawFrame`, emits VAD frames and forwards PCM. Set **`LegacyEmitUserFrames`** to also emit user speaking frames.
+- **`silero.Model`** — Silero v5. Build with `-tags onnx` and set `ONNXRUNTIME_LIB`. `make models` downloads the weights.
 
 ### Interrupt (`github.com/rohitdas13595/llmpipe/audio/interrupt`)
 
@@ -256,9 +265,11 @@ Atomic flag: is the bot currently speaking? Used for **echo suppression** (STT i
 
 ### Turn (`github.com/rohitdas13595/llmpipe/audio/turn`)
 
-- **`SilenceAnalyzer`** — `AppendAudio(pcm, sampleRate, isSpeech) State` for tests or custom stacks (default **3000 ms** stop unless overridden); mirrors Pipecat silence leg of smart-turn.
-- **`TrackingProcessor`** — inserts **`TurnStartedFrame`** / **`TurnEndedFrame`** (with `Complete` false on **`InterruptionFrame`**) after VAD; enable in voicebot with default **`TURN_TRACK=1`**, disable with `TURN_TRACK=0`.
-- **`EndOfTurnML`** — reserved interface for future ML smart-turn models.
+- **`Analyzer`** — `AppendAudio`, `AnalyzeEndOfTurn`, `Clear`.
+- **`SilenceAnalyzer`** — silence leg of that interface (default **3000 ms**).
+- **`smartturn.V3`** — Smart Turn v3. `LogMel` is pure Go (80 mels, n_fft 400, hop 160). The ONNX call needs `-tags onnx`.
+- **`TrackingProcessor`** — inserts **`TurnStartedFrame`** / **`TurnEndedFrame`** (with `Complete` false on **`InterruptionFrame`**) after the user-turn processor; enable in voicebot with default **`TURN_TRACK=1`**, disable with `TURN_TRACK=0`.
+- **`turns.UserTurnProcessor`** — `VADStart`, `TranscriptionStart`, `MinWordsStart`, `SpeechTimeoutStop`, `TurnAnalyzerStop`, `FirstSpeechMute`, `FunctionCallMute`. Emits user speaking frames and pushes **`InterruptionTaskFrame`** upstream when a turn starts while the bot is speaking.
 
 ---
 

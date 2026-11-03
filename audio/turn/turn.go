@@ -6,9 +6,5 @@
 //   - SilenceAnalyzer for tests / custom pipelines that supply isSpeech per chunk.
 //
 // Use TrackingProcessor to emit TurnStartedFrame / TurnEndedFrame for metrics or UX.
+// Analyzer (see analyzer.go) is the end-of-turn interface; smartturn.V3 implements it.
 package turn
-
-// EndOfTurnML is reserved for future ML-based smart-turn (Pipecat BaseSmartTurn subclasses).
-type EndOfTurnML interface {
-	Analyze(pcm []byte, sampleRate int, isSpeech bool) (endOfTurn bool)
-}

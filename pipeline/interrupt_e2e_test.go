@@ -15,6 +15,7 @@ import (
 	"github.com/rohitdas13595/llmpipe/processor"
 	"github.com/rohitdas13595/llmpipe/services"
 	"github.com/rohitdas13595/llmpipe/transport/base"
+	"github.com/rohitdas13595/llmpipe/turns"
 )
 
 func TestOneInterruptionReachesEveryNode(t *testing.T) {
@@ -214,7 +215,11 @@ func TestE2EInterruptWithin150ms(t *testing.T) {
 		},
 	}
 	asst := aggregate.NewAssistantAggregator("asst", ctxBag)
-	task := NewPipelineTask(NewPipeline(user, llm, scriptTTS{}, &clockOut{ao: ao}, asst))
+	ut := turns.NewUserTurnProcessor("turns", []turns.StartStrategy{
+		turns.TranscriptionStart{},
+		turns.MinWordsStart{N: 1, WhenBotSpeaking: true},
+	}, nil, nil)
+	task := NewPipelineTask(NewPipeline(ut, user, llm, scriptTTS{}, &clockOut{ao: ao}, asst))
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	done := make(chan error, 1)

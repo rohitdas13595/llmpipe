@@ -10,7 +10,9 @@ require (
 	github.com/livekit/protocol v1.45.1
 	github.com/livekit/server-sdk-go/v2 v2.16.1
 	github.com/pion/webrtc/v4 v4.2.6
+	github.com/yalue/onnxruntime_go v1.21.0
 	go.uber.org/goleak v1.3.0
+	gonum.org/v1/gonum v0.16.0
 	google.golang.org/genai v1.52.1
 	google.golang.org/protobuf v1.36.11
 )
