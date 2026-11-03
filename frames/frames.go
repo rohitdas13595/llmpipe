@@ -1,6 +1,8 @@
 // Package frames defines frame types for llmpipe pipelines.
 package frames
 
+import "time"
+
 // Frame is a marker interface for all frames.
 type Frame interface {
 	FrameKind() string
@@ -108,6 +110,12 @@ func (f *TTSAudioRawFrame) FrameKind() string { return KindTTSAudio }
 
 type TranscriptionFrame struct {
 	Text string
+	// Final is set when the recognizer will not revise Text.
+	Final bool
+	// Language is a BCP-47 tag when the recognizer reported one.
+	Language string
+	// Timestamp is when this transcript was produced.
+	Timestamp time.Time
 	Meta
 }
 

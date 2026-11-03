@@ -11,117 +11,48 @@ import (
 	"net/http"
 	"os"
 	"strings"
-	"sync"
 
 	"github.com/rohitdas13595/llmpipe/aggregate"
-	"github.com/rohitdas13595/llmpipe/frames"
-	"github.com/rohitdas13595/llmpipe/processor"
-	"github.com/rohitdas13595/llmpipe/services"
+	"github.com/rohitdas13595/llmpipe/services/ttsbase"
 )
 
 const ttsURL = "https://api.sarvam.ai/text-to-speech"
 
-// TTS calls Sarvam Bulbul REST API (linear16 PCM for the voicebot pipeline).
-type TTS struct {
-	name       string
-	APIKey     string
-	SampleRate int
-	Bot        *aggregate.BotState
-
-	services.Slot
-	mu         sync.Mutex
-	canceling  bool
-	textBuffer strings.Builder
-}
-
-func NewTTS(name, apiKey string, bot *aggregate.BotState, sampleRate int) *TTS {
+// NewTTS calls Sarvam Bulbul over REST, one request per sentence.
+// bot is accepted for compatibility; playback state comes from the output.
+func NewTTS(name, apiKey string, bot *aggregate.BotState, sampleRate int) *ttsbase.TTS {
+	_ = bot
 	if sampleRate <= 0 {
 		sampleRate = 16000
 	}
-	return &TTS{name: name, APIKey: apiKey, SampleRate: sampleRate, Bot: bot}
+	return ttsbase.New(&restSynth{apiKey: apiKey, sampleRate: sampleRate}, ttsbase.Options{
+		Name:           name,
+		SampleRate:     sampleRate,
+		PushTextFrames: true,
+	})
 }
 
-func (t *TTS) Name() string { return t.name }
-
-func (t *TTS) Process(ctx context.Context, f frames.Frame, dir processor.Direction, emit processor.Emit) error {
-	if dir == processor.Upstream {
-		processor.Forward(dir, f, emit)
-		return nil
-	}
-	switch fr := f.(type) {
-	case *frames.LLMFullResponseStartFrame:
-		t.mu.Lock()
-		t.canceling = false
-		t.textBuffer.Reset()
-		t.mu.Unlock()
-		emit.Down(f)
-	case *frames.LLMFullResponseEndFrame:
-		t.mu.Lock()
-		text := strings.TrimSpace(t.textBuffer.String())
-		t.textBuffer.Reset()
-		canceling := t.canceling
-		t.mu.Unlock()
-		synth := func(ctx context.Context, emit processor.Emit) {
-			t.speak(ctx, emit, text, canceling)
-			emit.Down(f)
-		}
-		if h := t.H(); h != nil {
-			turn := h.TurnContext()
-			go synth(turn, processor.Emit{Down: func(ff frames.Frame) {
-				_ = h.PushFrameCtx(turn, ff, processor.Downstream)
-			}})
-			return nil
-		}
-		synth(ctx, emit)
-		return nil
-	case *frames.InterruptionFrame:
-		t.mu.Lock()
-		t.canceling = true
-		t.textBuffer.Reset()
-		t.mu.Unlock()
-		emit.Down(f)
-	case *frames.LLMTextFrame:
-		t.mu.Lock()
-		t.textBuffer.WriteString(fr.Text)
-		t.mu.Unlock()
-		emit.Down(f)
-	case *frames.TextFrame:
-		t.mu.Lock()
-		t.textBuffer.WriteString(fr.Text)
-		t.mu.Unlock()
-		emit.Down(f)
-	default:
-		emit.Down(f)
-	}
-	return nil
+type restSynth struct {
+	apiKey     string
+	sampleRate int
 }
 
-func (t *TTS) speak(ctx context.Context, emit processor.Emit, text string, canceling bool) {
-	if canceling || text == "" {
-		return
+func (t *restSynth) Synthesize(ctx context.Context, text string, out func(ttsbase.AudioChunk) error) error {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return nil
 	}
-	if strings.TrimSpace(t.APIKey) == "" {
-		services.PipelineLog("tts", "sarvam: SARVAM_API_KEY is empty")
-		emit.Down(&frames.ErrorFrame{Err: fmt.Errorf("sarvam: missing API key")})
-		return
+	if strings.TrimSpace(t.apiKey) == "" {
+		return fmt.Errorf("sarvam: missing API key")
 	}
-	preview := text
-	if len(preview) > 120 {
-		preview = preview[:120] + "…"
-	}
-	services.PipelineLog("tts", "sarvam: synthesizing %d chars, preview: %q", len(text), preview)
 	pcm, sr, err := t.synth(ctx, text)
 	if err != nil {
-		services.PipelineLog("tts", "sarvam: %v", err)
-		emit.Down(&frames.ErrorFrame{Err: err})
-		return
+		return err
 	}
 	if len(pcm) == 0 {
-		services.PipelineLog("tts", "sarvam: empty PCM from API")
-		return
+		return nil
 	}
-	services.PipelineLog("tts", "sarvam: synthesized %d bytes PCM (%d Hz) for %d chars", len(pcm), sr, len(text))
-	services.EmitTTS(emit, text, pcm, sr)
+	return out(ttsbase.AudioChunk{PCM: pcm, SampleRate: sr})
 }
 
 type ttsRequest struct {
@@ -146,8 +77,8 @@ type errBody struct {
 	} `json:"error"`
 }
 
-func (t *TTS) synth(ctx context.Context, text string) ([]byte, int, error) {
-	srStr := sarvamSampleRateString(t.SampleRate)
+func (t *restSynth) synth(ctx context.Context, text string) ([]byte, int, error) {
+	srStr := sarvamSampleRateString(t.sampleRate)
 	lang := strings.TrimSpace(envOr("SARVAM_LANGUAGE", "en-IN"))
 	speaker := strings.TrimSpace(envOr("SARVAM_SPEAKER", "shubh"))
 	model := strings.TrimSpace(envOr("SARVAM_TTS_MODEL", "bulbul:v3"))
@@ -176,7 +107,7 @@ func (t *TTS) synth(ctx context.Context, text string) ([]byte, int, error) {
 	if err != nil {
 		return nil, 0, err
 	}
-	req.Header.Set("api-subscription-key", t.APIKey)
+	req.Header.Set("api-subscription-key", t.apiKey)
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := http.DefaultClient.Do(req)
@@ -202,11 +133,11 @@ func (t *TTS) synth(ctx context.Context, text string) ([]byte, int, error) {
 	if err != nil {
 		return nil, 0, fmt.Errorf("sarvam: decode base64: %w", err)
 	}
-	pcm, wavSR := rawPCMFromWAVOrLinear(decoded, t.SampleRate)
+	pcm, wavSR := rawPCMFromWAVOrLinear(decoded, t.sampleRate)
 	if wavSR > 0 {
 		return pcm, wavSR, nil
 	}
-	return pcm, t.SampleRate, nil
+	return pcm, t.sampleRate, nil
 }
 
 func envOr(k, def string) string {

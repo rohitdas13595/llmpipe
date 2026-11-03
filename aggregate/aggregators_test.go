@@ -18,6 +18,7 @@ func TestUserAggregatorTranscriptionEmitsLLMRun(t *testing.T) {
 	ctxBag := NewLLMContext("")
 	bot := NewBotState()
 	u := NewUserAggregator("ua", ctxBag, bot, interrupt.NoInterrupt{})
+	u.SetParams(UserAggregatorParams{AggregationTimeout: 0})
 	var kinds []string
 	tail := processor.Func{
 		N: "tail",
@@ -44,6 +45,102 @@ func TestUserAggregatorTranscriptionEmitsLLMRun(t *testing.T) {
 	msgs := ctxBag.Snapshot()
 	if len(msgs) != 1 || msgs[0]["content"] != "hello" {
 		t.Fatalf("context = %#v", msgs)
+	}
+}
+
+func TestOneLLMRunPerTurn(t *testing.T) {
+	// Process directly. Queuing these together on a task would let the system
+	// lane run UserStopped ahead of the data-lane transcripts.
+	ctxBag := NewLLMContext("")
+	u := NewUserAggregator("ua", ctxBag, NewBotState(), interrupt.NoInterrupt{})
+	u.SetParams(UserAggregatorParams{AggregationTimeout: 0})
+	var runs int
+	emit := processor.Emit{Down: func(f frames.Frame) {
+		if _, ok := f.(*frames.LLMRunFrame); ok {
+			runs++
+		}
+	}, Up: func(frames.Frame) {}}
+	ctx := context.Background()
+	steps := []frames.Frame{
+		&frames.UserStartedSpeakingFrame{},
+		&frames.TranscriptionFrame{Text: "hello"},
+		&frames.TranscriptionFrame{Text: "there"},
+		&frames.UserStoppedSpeakingFrame{},
+	}
+	for _, f := range steps {
+		if err := u.Process(ctx, f, processor.Downstream, emit); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if runs != 1 {
+		t.Fatalf("llm runs = %d, want 1", runs)
+	}
+	msgs := ctxBag.Snapshot()
+	if len(msgs) != 1 || msgs[0]["content"] != "hello there" {
+		t.Fatalf("context = %#v", msgs)
+	}
+}
+
+func TestAggregationTimeoutCoalescesLateFinal(t *testing.T) {
+	ctxBag := NewLLMContext("")
+	u := NewUserAggregator("ua", ctxBag, NewBotState(), interrupt.NoInterrupt{})
+	u.SetParams(UserAggregatorParams{AggregationTimeout: 120 * time.Millisecond})
+	var runs atomic.Int32
+	tail := processor.Func{
+		N: "tail",
+		F: func(ctx context.Context, f frames.Frame, dir processor.Direction, emit processor.Emit) error {
+			if _, ok := f.(*frames.LLMRunFrame); ok {
+				runs.Add(1)
+			}
+			return nil
+		},
+	}
+	task := pipeline.NewPipelineTask(pipeline.NewPipeline(u, tail))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- task.Run(ctx) }()
+	deadline := time.Now().Add(2 * time.Second)
+	for !task.Running() {
+		if time.Now().After(deadline) {
+			t.Fatal("task did not start")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if err := task.QueueFrames(context.Background(), []frames.Frame{
+		&frames.UserStartedSpeakingFrame{},
+		&frames.TranscriptionFrame{Text: "hello"},
+		&frames.UserStoppedSpeakingFrame{},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(25 * time.Millisecond)
+	if runs.Load() != 0 {
+		t.Fatalf("ran before timeout: %d", runs.Load())
+	}
+	if err := task.QueueFrame(context.Background(), &frames.TranscriptionFrame{Text: "there"}); err != nil {
+		t.Fatal(err)
+	}
+	deadline = time.Now().Add(2 * time.Second)
+	for runs.Load() != 1 {
+		if time.Now().After(deadline) {
+			t.Fatalf("runs = %d", runs.Load())
+		}
+		time.Sleep(time.Millisecond)
+	}
+	time.Sleep(60 * time.Millisecond)
+	if runs.Load() != 1 {
+		t.Fatalf("extra runs = %d", runs.Load())
+	}
+	msgs := ctxBag.Snapshot()
+	if len(msgs) != 1 || msgs[0]["content"] != "hello there" {
+		t.Fatalf("context = %#v", msgs)
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("stop")
 	}
 }
 

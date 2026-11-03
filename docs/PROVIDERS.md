@@ -9,7 +9,7 @@ Chain: **VAD → STT → user agg → LLM → assistant agg → TTS** (see `cmd/
 
 | Env `STT`            | Pipecat package                           | llmpipe implementation                                                                                |
 | -------------------- | ----------------------------------------- | ----------------------------------------------------------------------------------------------------- |
-| `deepgram` (default) | `deepgram/stt.py`                         | `services/deepgram` — prerecorded HTTP                                                                |
+| `deepgram` (default) | `deepgram/stt.py`                         | `services/deepgram` — streaming websocket (`nova-3`, interim results). `STT=deepgram_batch` keeps prerecorded HTTP |
 | `google` / `gemini`  | `google/stt.py` (Cloud Speech v2)         | `services/google` — **Gemini multimodal** transcribe (WAV + `GenerateContent`; uses `GEMINI_API_KEY`) |
 | `openai` / `whisper` | `openai/stt.py` (`BaseWhisperSTTService`) | `services/whisper` — OpenAI `/v1/audio/transcriptions`                                                |
 | `groq`               | `groq/stt.py`                             | `services/whisper` with `GROQ_BASE_URL` default `https://api.groq.com/openai/v1`                      |
@@ -67,12 +67,12 @@ Vertex / Google Cloud paths (`google/vertex/llm.py`, etc.) use different clients
 
 | Env `TTS`              | Pipecat                      | llmpipe                                                                                        |
 | ---------------------- | ---------------------------- | ---------------------------------------------------------------------------------------------- |
-| `elevenlabs` (default) | `elevenlabs/tts.py`          | `services/elevenlabs`                                                                          |
-| `openai`               | `openai/tts.py` (24 kHz PCM) | `services/openai` (`NewTTSService`) — resamples to `SAMPLE_RATE`                               |
+| `elevenlabs` (default) | `elevenlabs/tts.py`          | `services/elevenlabs` — multi-stream websocket (`eleven_flash_v2_5`). `TTS=elevenlabs_rest` keeps HTTP |
+| `openai`               | `openai/tts.py` (24 kHz PCM) | `services/openai` (`NewTTSService`) — sentence aggregator, resamples to `SAMPLE_RATE`          |
 | `groq`                 | `groq/tts.py`                | `services/openai` — OpenAI-shaped `/v1/audio/speech` at Groq base (`NewTTSServiceWithBaseURL`) |
 | `google`               | `google/tts.py`              | stub                                                                                           |
 | `aws`                  | `aws/tts.py`                 | stub                                                                                           |
-| `sarvam`               | `sarvam/tts.py`              | `services/sarvam`                                                                              |
+| `sarvam`               | `sarvam/tts.py`              | `services/sarvam` — REST via `ttsbase`, one request per sentence                               |
 
 
 Other Pipecat TTS backends (`cartesia`, `deepgram`, `xai`, `kokoro`, `cartesia`, …) are **not** ported; extend `providers.BuildTTS` or use Pipecat Python.

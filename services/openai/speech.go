@@ -9,135 +9,64 @@ import (
 	"net/http"
 	"os"
 	"strings"
-	"sync"
 
 	"github.com/rohitdas13595/llmpipe/aggregate"
-	"github.com/rohitdas13595/llmpipe/frames"
 	"github.com/rohitdas13595/llmpipe/internal/resample"
-	"github.com/rohitdas13595/llmpipe/processor"
-	"github.com/rohitdas13595/llmpipe/services"
+	"github.com/rohitdas13595/llmpipe/services/ttsbase"
 )
 
-// TTSService streams synthesized audio via OpenAI /v1/audio/speech (Pipecat: OpenAITTSService, 24 kHz PCM).
+// TTSService synthesizes with OpenAI /v1/audio/speech (24 kHz PCM, resampled
+// to the pipeline rate) and speaks one sentence at a time.
 type TTSService struct {
-	name       string
-	APIKey     string
-	BaseURL    string
-	Model      string
-	Voice      string
-	SampleRate int // pipeline / output rate (resampled from 24000)
-	Bot        *aggregate.BotState
-
-	services.Slot
-	mu         sync.Mutex
-	canceling  bool
-	textBuffer strings.Builder
+	*ttsbase.TTS
 }
 
 func NewTTSService(name, apiKey, voice string, bot *aggregate.BotState, pipelineSampleRate int) *TTSService {
-	if pipelineSampleRate <= 0 {
-		pipelineSampleRate = 16000
-	}
-	base := os.Getenv("OPENAI_BASE_URL")
-	if base == "" {
-		base = "https://api.openai.com/v1"
-	}
-	model := os.Getenv("OPENAI_TTS_MODEL")
-	if model == "" {
-		model = "tts-1"
-	}
-	if voice == "" {
-		voice = "alloy"
-	}
-	return &TTSService{
-		name:       name,
-		APIKey:     apiKey,
-		BaseURL:    strings.TrimSuffix(base, "/"),
-		Model:      model,
-		Voice:      voice,
-		SampleRate: pipelineSampleRate,
-		Bot:        bot,
-	}
+	return NewTTSServiceWithBaseURL(name, apiKey, "", "", voice, bot, pipelineSampleRate)
 }
 
-// NewTTSServiceWithBaseURL is like NewTTSService but fixes BaseURL, model, and voice (Pipecat-style per-provider TTS).
+// NewTTSServiceWithBaseURL fixes the base URL, model, and voice (Groq and other
+// OpenAI-compatible speech endpoints).
 func NewTTSServiceWithBaseURL(name, apiKey, baseURL, model, voice string, bot *aggregate.BotState, pipelineSampleRate int) *TTSService {
+	_ = bot
 	if pipelineSampleRate <= 0 {
 		pipelineSampleRate = 16000
+	}
+	if baseURL == "" {
+		baseURL = os.Getenv("OPENAI_BASE_URL")
 	}
 	if baseURL == "" {
 		baseURL = "https://api.openai.com/v1"
 	}
 	if model == "" {
+		model = os.Getenv("OPENAI_TTS_MODEL")
+	}
+	if model == "" {
 		model = "tts-1"
 	}
 	if voice == "" {
 		voice = "alloy"
 	}
-	return &TTSService{
-		name:       name,
-		APIKey:     apiKey,
-		BaseURL:    strings.TrimSuffix(baseURL, "/"),
-		Model:      model,
-		Voice:      voice,
-		SampleRate: pipelineSampleRate,
-		Bot:        bot,
+	synth := &restSynth{
+		apiKey:     apiKey,
+		baseURL:    strings.TrimSuffix(baseURL, "/"),
+		model:      model,
+		voice:      voice,
+		sampleRate: pipelineSampleRate,
 	}
+	return &TTSService{TTS: ttsbase.New(synth, ttsbase.Options{
+		Name:           name,
+		SampleRate:     pipelineSampleRate,
+		PushTextFrames: true,
+	})}
 }
 
-func (t *TTSService) Name() string { return t.name }
-
-func (t *TTSService) Process(ctx context.Context, f frames.Frame, dir processor.Direction, emit processor.Emit) error {
-	if dir == processor.Upstream {
-		processor.Forward(dir, f, emit)
-		return nil
-	}
-	switch fr := f.(type) {
-	case *frames.LLMFullResponseStartFrame:
-		t.mu.Lock()
-		t.canceling = false
-		t.textBuffer.Reset()
-		t.mu.Unlock()
-		emit.Down(f)
-	case *frames.LLMFullResponseEndFrame:
-		t.mu.Lock()
-		text := strings.TrimSpace(t.textBuffer.String())
-		t.textBuffer.Reset()
-		canceling := t.canceling
-		t.mu.Unlock()
-		synth := func(ctx context.Context, emit processor.Emit) {
-			t.speak(ctx, emit, text, canceling)
-			emit.Down(f)
-		}
-		if h := t.H(); h != nil {
-			turn := h.TurnContext()
-			go synth(turn, processor.Emit{Down: func(ff frames.Frame) {
-				_ = h.PushFrameCtx(turn, ff, processor.Downstream)
-			}})
-			return nil
-		}
-		synth(ctx, emit)
-		return nil
-	case *frames.InterruptionFrame:
-		t.mu.Lock()
-		t.canceling = true
-		t.textBuffer.Reset()
-		t.mu.Unlock()
-		emit.Down(f)
-	case *frames.LLMTextFrame:
-		t.mu.Lock()
-		t.textBuffer.WriteString(fr.Text)
-		t.mu.Unlock()
-		emit.Down(f)
-	case *frames.TextFrame:
-		t.mu.Lock()
-		t.textBuffer.WriteString(fr.Text)
-		t.mu.Unlock()
-		emit.Down(f)
-	default:
-		emit.Down(f)
-	}
-	return nil
+type restSynth struct {
+	apiKey     string
+	baseURL    string
+	model      string
+	voice      string
+	sampleRate int
 }
 
 type speechReq struct {
@@ -149,47 +78,52 @@ type speechReq struct {
 
 const openAITTSRate = 24000
 
-func (t *TTSService) speak(ctx context.Context, emit processor.Emit, text string, canceling bool) {
-	if canceling || text == "" {
-		return
+func (t *restSynth) Synthesize(ctx context.Context, text string, out func(ttsbase.AudioChunk) error) error {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return nil
 	}
-	if t.APIKey == "" {
-		emit.Down(&frames.ErrorFrame{Err: fmt.Errorf("openai tts: missing API key")})
-		return
+	if t.apiKey == "" {
+		return fmt.Errorf("openai tts: missing API key")
 	}
-	body, _ := json.Marshal(speechReq{
-		Model:          t.Model,
+	body, err := json.Marshal(speechReq{
+		Model:          t.model,
 		Input:          text,
-		Voice:          t.Voice,
+		Voice:          t.voice,
 		ResponseFormat: "pcm",
 	})
-	base := t.BaseURL
+	if err != nil {
+		return err
+	}
+	base := t.baseURL
 	if base == "" {
 		base = "https://api.openai.com/v1"
 	}
-	u := base + "/audio/speech"
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, base+"/audio/speech", bytes.NewReader(body))
 	if err != nil {
-		emit.Down(&frames.ErrorFrame{Err: err})
-		return
+		return err
 	}
-	req.Header.Set("Authorization", "Bearer "+t.APIKey)
+	req.Header.Set("Authorization", "Bearer "+t.apiKey)
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		emit.Down(&frames.ErrorFrame{Err: err})
-		return
+		return err
 	}
 	defer func() { _ = resp.Body.Close() }()
 	raw, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusOK {
-		emit.Down(&frames.ErrorFrame{Err: fmt.Errorf("openai tts: %s: %s", resp.Status, string(raw))})
-		return
+		return fmt.Errorf("openai tts: %s: %s", resp.Status, string(raw))
 	}
 	pcm := raw
-	if t.SampleRate != openAITTSRate {
-		pcm = resample.LinearS16LE(pcm, openAITTSRate, t.SampleRate)
+	sr := t.sampleRate
+	if sr <= 0 {
+		sr = 16000
 	}
-	services.PipelineLog("tts", "openai: pcm %d bytes → %d Hz", len(pcm), t.SampleRate)
-	services.EmitTTS(emit, text, pcm, t.SampleRate)
+	if sr != openAITTSRate {
+		pcm = resample.LinearS16LE(pcm, openAITTSRate, sr)
+	}
+	if len(pcm) == 0 {
+		return nil
+	}
+	return out(ttsbase.AudioChunk{PCM: pcm, SampleRate: sr})
 }
