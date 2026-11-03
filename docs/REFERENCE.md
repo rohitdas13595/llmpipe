@@ -65,7 +65,9 @@ Typical **voicebot** order (as in `cmd/voicebot/main.go`):
 | `github.com/rohitdas13595/llmpipe/audio/turn` | `Analyzer`, silence fallback, turn tracking |
 | `github.com/rohitdas13595/llmpipe/audio/turn/smartturn` | Smart Turn v3 features and ONNX model |
 | `github.com/rohitdas13595/llmpipe/processors/idle` | User idle timer processor |
-| `github.com/rohitdas13595/llmpipe/processors/tools` | Reserved for tool/function-call wiring |
+| `github.com/rohitdas13595/llmpipe/processors/tools` | Function registry, JSON Schema via `Typed[T]`, handlers |
+| `github.com/rohitdas13595/llmpipe/adapters` | Provider wire formats for messages and tools |
+| `github.com/rohitdas13595/llmpipe/services/llmbase` | Parallel tool execution, cancellation, streamed call reassembly |
 | `github.com/rohitdas13595/llmpipe/services/*` | Provider-specific STT/LLM/TTS processors |
 | `github.com/rohitdas13595/llmpipe/providers` | Env-based provider wiring; Pipecat mapping in [`PROVIDERS.md`](PROVIDERS.md) |
 
@@ -223,11 +225,13 @@ Services embed `services.Slot`. `PipelineTask` calls `Setup` before frames flow.
 
 ### `LLMContext`
 
-Thread-safe message list as `[]map[string]any` (OpenAI-style `role` / `content`).
+Thread-safe transcript of typed `Message` values (`Role`, `Content`, `ToolCalls`, `ToolCallID`, `Name`).
 
 - **`NewLLMContext(systemPrompt string)`**
-- **`AppendUser` / `AppendAssistant`**
-- **`Snapshot()`** — copy for LLM calls
+- **`AppendUser` / `AppendAssistant` / `Append`**
+- **`Messages()`** — copy of the typed transcript
+- **`AppendToolRound` / `SetToolResult`** — assistant tool calls, then the placeholder tool messages those calls fill
+- **`Snapshot()`** — deprecated OpenAI-style `[]map[string]any` view, kept for one release
 
 ### `BotState`
 
@@ -242,8 +246,9 @@ Atomic flag: is the bot currently speaking? Used for **echo suppression** (STT i
 ### `AssistantAggregator`
 
 - Maps **`LLMTextFrame` → `TextFrame`** for TTS (chunk-wise).
-- On **`LLMFullResponseEndFrame`**, commits full assistant text to `LLMContext`.
-- Resets partial buffer on interruption / response start.
+- On **`LLMFullResponseEndFrame`**, commits full assistant text to `LLMContext` when the response did not call tools.
+- On **`FunctionCallsStartedFrame`**, appends the assistant tool-call message (the text the model produced with the calls) and one placeholder tool message per call. **`FunctionCallResultFrame`** fills a placeholder. After the last result that was not cancelled, it pushes one **`LLMRunFrame`** upstream. A cancelled call is stored as `CANCELLED` and does not start that follow-up.
+- Resets partial buffer on interruption / response start. Tool-call messages are kept so the next request stays valid for the provider.
 
 ---
 

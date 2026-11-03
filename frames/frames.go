@@ -1,7 +1,11 @@
 // Package frames defines frame types for llmpipe pipelines.
 package frames
 
-import "time"
+import (
+	"time"
+
+	"github.com/rohitdas13595/llmpipe/processors/tools"
+)
 
 // Frame is a marker interface for all frames.
 type Frame interface {
@@ -35,7 +39,10 @@ const (
 	KindLLMFullResponseStart   = "LLMFullResponseStart"
 	KindLLMFullResponseEnd     = "LLMFullResponseEnd"
 	KindLLMSetTools            = "LLMSetTools"
+	KindFunctionCallsStarted   = "FunctionCallsStarted"
+	KindFunctionCallInProgress = "FunctionCallInProgress"
 	KindFunctionCallResult     = "FunctionCallResult"
+	KindFunctionCallCancel     = "FunctionCallCancel"
 	KindTurnStarted            = "TurnStarted"
 	KindTurnEnded              = "TurnEnded"
 	KindTransportMessage       = "TransportMessage"
@@ -253,7 +260,7 @@ type LLMFullResponseEndFrame struct {
 func (f *LLMFullResponseEndFrame) FrameKind() string { return KindLLMFullResponseEnd }
 
 type LLMSetToolsFrame struct {
-	Tools any // schema per provider
+	Tools tools.Schema
 	Control
 	Meta
 }
@@ -262,7 +269,11 @@ func (f *LLMSetToolsFrame) FrameKind() string { return KindLLMSetTools }
 
 type FunctionCallResultFrame struct {
 	CallID string
+	Name   string
 	Result string
+	// RunLLM nil means the batch should trigger one follow-up LLM run.
+	RunLLM    *bool
+	Cancelled bool
 	Uninterruptible
 	Meta
 }

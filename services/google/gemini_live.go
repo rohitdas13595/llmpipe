@@ -10,10 +10,13 @@ import (
 
 	"google.golang.org/genai"
 
+	gem "github.com/rohitdas13595/llmpipe/adapters/gemini"
 	"github.com/rohitdas13595/llmpipe/aggregate"
 	"github.com/rohitdas13595/llmpipe/frames"
 	"github.com/rohitdas13595/llmpipe/processor"
+	"github.com/rohitdas13595/llmpipe/processors/tools"
 	"github.com/rohitdas13595/llmpipe/services"
+	"github.com/rohitdas13595/llmpipe/services/llmbase"
 )
 
 // GeminiLive streams bidirectional audio over the Gemini Multimodal Live WebSocket (google.genai Live API).
@@ -28,11 +31,21 @@ type GeminiLive struct {
 	services.Slot
 	started    atomic.Bool
 	mu         sync.Mutex
-	session    *genai.Session
+	session    liveSession
 	recvCancel context.CancelFunc
 	sampleRate int
 	connecting bool
 	connectErr error
+	tools      *llmbase.Bag
+	fns        llmbase.CancelGroup
+}
+
+// liveSession is the subset of *genai.Session the processor uses.
+type liveSession interface {
+	SendRealtimeInput(genai.LiveRealtimeInput) error
+	SendToolResponse(genai.LiveToolResponseInput) error
+	Receive() (*genai.LiveServerMessage, error)
+	Close() error
 }
 
 func NewGeminiLive(name string, client *genai.Client, model, system string, re services.ReenterFunc, bot *aggregate.BotState) *GeminiLive {
@@ -41,7 +54,16 @@ func NewGeminiLive(name string, client *genai.Client, model, system string, re s
 	}
 	return &GeminiLive{
 		name: name, Client: client, Model: model, SystemPrompt: system, Reenter: re, Bot: bot,
+		tools: &llmbase.Bag{},
 	}
+}
+
+// SetRegistry installs function handlers. The declarations are sent on Live.Connect.
+func (g *GeminiLive) SetRegistry(r *tools.Registry) {
+	if g.tools == nil {
+		g.tools = &llmbase.Bag{}
+	}
+	g.tools.SetRegistry(r)
 }
 
 func (g *GeminiLive) Name() string { return g.name }
@@ -114,6 +136,12 @@ func (g *GeminiLive) Process(ctx context.Context, f frames.Frame, dir processor.
 		}
 		processor.Forward(dir, f, emit)
 	case *frames.InterruptionFrame:
+		g.fns.Cancel()
+		processor.Forward(dir, f, emit)
+	case *frames.LLMSetToolsFrame:
+		if g.tools != nil {
+			g.tools.SetSchema(fr.Tools)
+		}
 		processor.Forward(dir, f, emit)
 	case *frames.CancelFrame, *frames.EndFrame:
 		g.shutdown()
@@ -149,6 +177,17 @@ func (g *GeminiLive) connect(bg context.Context) {
 	}
 	if strings.TrimSpace(g.SystemPrompt) != "" {
 		cfg.SystemInstruction = &genai.Content{Parts: []*genai.Part{{Text: g.SystemPrompt}}}
+	}
+	if g.tools != nil {
+		schema := g.tools.Schema()
+		if len(schema.Functions) > 0 {
+			wire, err := (gem.API{}).Tools(schema)
+			if err == nil {
+				if declared, ok := wire.([]*genai.Tool); ok {
+					cfg.Tools = declared
+				}
+			}
+		}
 	}
 	ctx, cancel := context.WithCancel(bg)
 	sess, err := g.Client.Live.Connect(ctx, g.Model, cfg)
@@ -187,29 +226,98 @@ func (g *GeminiLive) receiveLoop(ctx context.Context, sess *genai.Session) {
 		if msg == nil {
 			continue
 		}
-		if msg.ServerContent != nil && msg.ServerContent.Interrupted {
-			g.signalInterruption(ctx)
-		}
-		if msg.ServerContent != nil && msg.ServerContent.ModelTurn != nil {
-			for _, p := range msg.ServerContent.ModelTurn.Parts {
-				if p == nil || p.InlineData == nil {
-					continue
-				}
-				d := p.InlineData.Data
-				if len(d) == 0 {
-					continue
-				}
-				mime := p.InlineData.MIMEType
-				rate := 24000
-				if i := strings.Index(mime, "rate="); i >= 0 {
-					if n, err := strconv.Atoi(strings.TrimSpace(mime[i+5:])); err == nil && n > 0 {
-						rate = n
-					}
-				}
-				_ = g.push(ctx, &frames.TTSAudioRawFrame{Audio: d, SampleRate: rate, NumChannels: 1})
+		g.handleLive(ctx, msg)
+	}
+}
+
+func (g *GeminiLive) handleLive(ctx context.Context, msg *genai.LiveServerMessage) {
+	if msg == nil {
+		return
+	}
+	if msg.ToolCallCancellation != nil {
+		g.fns.Cancel()
+	}
+	if msg.ServerContent != nil && msg.ServerContent.Interrupted {
+		g.signalInterruption(ctx)
+	}
+	if msg.ServerContent != nil && msg.ServerContent.ModelTurn != nil {
+		for _, p := range msg.ServerContent.ModelTurn.Parts {
+			if p == nil || p.InlineData == nil {
+				continue
 			}
+			d := p.InlineData.Data
+			if len(d) == 0 {
+				continue
+			}
+			mime := p.InlineData.MIMEType
+			rate := 24000
+			if i := strings.Index(mime, "rate="); i >= 0 {
+				if n, err := strconv.Atoi(strings.TrimSpace(mime[i+5:])); err == nil && n > 0 {
+					rate = n
+				}
+			}
+			_ = g.push(ctx, &frames.TTSAudioRawFrame{Audio: d, SampleRate: rate, NumChannels: 1})
 		}
 	}
+	if msg.ToolCall != nil && len(msg.ToolCall.FunctionCalls) > 0 {
+		g.runToolCalls(msg.ToolCall.FunctionCalls)
+	}
+}
+
+func (g *GeminiLive) runToolCalls(calls []*genai.FunctionCall) {
+	if g.tools == nil || g.tools.Registry() == nil {
+		return
+	}
+	by := map[string]*aggregate.ToolCall{}
+	var order []string
+	for _, fc := range calls {
+		collectCall(by, &order, fc)
+	}
+	got := orderedCalls(by, order)
+	if len(got) == 0 {
+		return
+	}
+	parent := g.ProcContext()
+	turn := g.fns.Replace(parent)
+	var mu sync.Mutex
+	results := map[string]string{}
+	go llmbase.Run(turn, parent, g.tools, nil, "", got, llmbase.Hooks{
+		Down: func(ctx context.Context, f frames.Frame) error { return g.push(ctx, f) },
+		Up: func(ctx context.Context, f frames.Frame) error {
+			if g.H() == nil {
+				return nil
+			}
+			return services.PushUp(ctx, g.H(), g.name, f)
+		},
+		OnResult: func(call aggregate.ToolCall, res tools.Result, cancelled bool) {
+			if cancelled {
+				return
+			}
+			mu.Lock()
+			results[call.ID] = res.Content
+			mu.Unlock()
+		},
+		OnBatchDone: func(cancelled bool) {
+			if cancelled {
+				return
+			}
+			frs := make([]*genai.FunctionResponse, 0, len(got))
+			mu.Lock()
+			for _, c := range got {
+				frs = append(frs, &genai.FunctionResponse{
+					ID: c.ID, Name: c.Name, Response: gem.OutputMap(results[c.ID]),
+				})
+			}
+			mu.Unlock()
+			g.mu.Lock()
+			sess := g.session
+			g.mu.Unlock()
+			if sess == nil || len(frs) == 0 {
+				return
+			}
+			_ = sess.SendToolResponse(genai.LiveToolResponseInput{FunctionResponses: frs})
+		},
+	})
 }
 
 func (g *GeminiLive) shutdown() {

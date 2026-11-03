@@ -72,7 +72,8 @@ func main() {
 	ttsBackend := strings.ToLower(providers.EnvOr("TTS", "elevenlabs"))
 	pipeMode := providers.PipelineMode()
 
-	ctxLLM := aggregate.NewLLMContext(providers.EnvOr("SYSTEM_PROMPT", "You are a concise voice assistant."))
+	reg := providers.ToolRegistryFromEnv()
+	ctxLLM := aggregate.NewLLMContext(providers.WithToolPrompt(providers.EnvOr("SYSTEM_PROMPT", "You are a concise voice assistant.")))
 	bot := aggregate.NewBotState()
 	strategy := interrupt.MinWords{N: 1}
 
@@ -116,23 +117,28 @@ func main() {
 	switch pipeMode {
 	case "gemini_live", "google_live":
 		log.Printf("PIPELINE=%s — Gemini Live (Pipecat google/gemini_live)", pipeMode)
+		live := providers.BuildGeminiLive(nil, bot, providers.WithToolPrompt(providers.EnvOr("SYSTEM_PROMPT", "")))
+		providers.AttachTools(live, reg)
 		procs = []processor.Processor{
 			userIdle,
 			tr.Input(),
-			providers.BuildGeminiLive(nil, bot, providers.EnvOr("SYSTEM_PROMPT", "")),
+			live,
 			tr.Output(),
 		}
 	case "openai_realtime":
 		log.Printf("PIPELINE=openai_realtime (Pipecat openai/realtime)")
+		rt := providers.BuildOpenAIRealtime(nil, bot, providers.WithToolPrompt(providers.EnvOr("SYSTEM_PROMPT", "")))
+		providers.AttachTools(rt, reg)
 		procs = []processor.Processor{
 			userIdle,
 			tr.Input(),
-			providers.BuildOpenAIRealtime(nil, bot, providers.EnvOr("SYSTEM_PROMPT", "")),
+			rt,
 			tr.Output(),
 		}
 	default:
 		stt := providers.BuildSTT(sttBackend, nil, sampleRate, bot)
 		llm := providers.BuildLLM(llmBackend, nil, ctxLLM)
+		providers.AttachTools(llm, reg)
 		tts := providers.BuildTTS(ttsBackend, bot, sampleRate)
 		procs = []processor.Processor{
 			userIdle,

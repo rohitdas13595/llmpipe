@@ -2,6 +2,7 @@ package aggregate
 
 import (
 	"context"
+	"encoding/json"
 	"strings"
 
 	"github.com/rohitdas13595/llmpipe/frames"
@@ -13,14 +14,25 @@ import (
 // the spoken words. When the pipeline has no TTS, the full LLM text is
 // committed at the end of the response.
 type AssistantAggregator struct {
-	name    string
-	ctx     *LLMContext
-	llm     strings.Builder
-	spoken  strings.Builder
-	sawTTS  bool
-	ended   bool
-	stopped bool
-	closed  bool
+	name             string
+	ctx              *LLMContext
+	llm              strings.Builder
+	spoken           strings.Builder
+	sawTTS           bool
+	ended            bool
+	stopped          bool
+	closed           bool
+	toolRound        bool
+	followed         bool
+	suppressFollowUp bool
+	pending          []toolPending
+}
+
+type toolPending struct {
+	id        string
+	done      bool
+	cancelled bool
+	wants     *bool
 }
 
 func NewAssistantAggregator(name string, c *LLMContext) *AssistantAggregator {
@@ -34,7 +46,10 @@ func (a *AssistantAggregator) Process(ctx context.Context, f frames.Frame, dir p
 	case *frames.LLMFullResponseStartFrame:
 		// Played TTS text is system priority, so it can reach this aggregator
 		// before the control frame that opened the response. Keep that text.
-		if a.closed || !a.sawTTS {
+		// A follow-up after tools is a new response and must reset.
+		// FunctionCallsStarted is system priority and can be processed before
+		// this start frame. Don't drop a tool round that is still open.
+		if !(a.toolRound && !a.followed) && (a.followed || a.closed || !a.sawTTS) {
 			a.reset()
 		}
 		processor.Forward(dir, f, emit)
@@ -66,7 +81,19 @@ func (a *AssistantAggregator) Process(ctx context.Context, f frames.Frame, dir p
 		}
 		processor.Forward(dir, f, emit)
 	case *frames.InterruptionFrame:
+		a.suppressFollowUp = true
 		a.commitPlayed()
+		processor.Forward(dir, f, emit)
+	case *frames.FunctionCallsStartedFrame:
+		a.noteTools(fr)
+		processor.Forward(dir, f, emit)
+	case *frames.FunctionCallInProgressFrame:
+		processor.Forward(dir, f, emit)
+	case *frames.FunctionCallResultFrame:
+		a.noteResult(fr, emit)
+		processor.Forward(dir, f, emit)
+	case *frames.FunctionCallCancelFrame:
+		a.noteCancel(fr)
 		processor.Forward(dir, f, emit)
 	default:
 		processor.Forward(dir, f, emit)
@@ -75,7 +102,7 @@ func (a *AssistantAggregator) Process(ctx context.Context, f frames.Frame, dir p
 }
 
 func (a *AssistantAggregator) maybeCommit() {
-	if a.closed {
+	if a.closed || a.toolRound {
 		return
 	}
 	if a.sawTTS {
@@ -91,6 +118,11 @@ func (a *AssistantAggregator) maybeCommit() {
 
 func (a *AssistantAggregator) commitPlayed() {
 	if a.closed {
+		return
+	}
+	if a.toolRound {
+		a.llm.Reset()
+		a.spoken.Reset()
 		return
 	}
 	if a.sawTTS {
@@ -123,6 +155,80 @@ func (a *AssistantAggregator) reset() {
 	a.ended = false
 	a.stopped = false
 	a.closed = false
+	a.toolRound = false
+	a.followed = false
+	a.suppressFollowUp = false
+	a.pending = nil
+}
+
+func (a *AssistantAggregator) noteTools(fr *frames.FunctionCallsStartedFrame) {
+	if a.ctx == nil || fr == nil || len(fr.Batch) == 0 {
+		return
+	}
+	calls := make([]ToolCall, len(fr.Batch))
+	a.pending = nil
+	for i, c := range fr.Batch {
+		calls[i] = ToolCall{ID: c.ID, Name: c.Name, Args: append(json.RawMessage(nil), c.Args...)}
+		a.pending = append(a.pending, toolPending{id: c.ID})
+	}
+	a.ctx.AppendToolRound(fr.Content, calls)
+	a.toolRound = true
+	a.followed = false
+	a.llm.Reset()
+}
+
+func (a *AssistantAggregator) noteResult(fr *frames.FunctionCallResultFrame, emit processor.Emit) {
+	if fr == nil {
+		return
+	}
+	if a.ctx != nil {
+		a.ctx.SetToolResult(fr.CallID, fr.Result)
+	}
+	for i := range a.pending {
+		if a.pending[i].id == fr.CallID {
+			a.pending[i].done = true
+			a.pending[i].cancelled = fr.Cancelled
+			a.pending[i].wants = fr.RunLLM
+		}
+	}
+	if a.suppressFollowUp || a.followed || len(a.pending) == 0 {
+		return
+	}
+	wants := false
+	for _, p := range a.pending {
+		if !p.done {
+			return
+		}
+		if p.cancelled {
+			return
+		}
+		if p.wants == nil || *p.wants {
+			wants = true
+		}
+	}
+	if !wants {
+		return
+	}
+	a.followed = true
+	if emit.Up != nil {
+		emit.Up(&frames.LLMRunFrame{})
+	}
+}
+
+func (a *AssistantAggregator) noteCancel(fr *frames.FunctionCallCancelFrame) {
+	if fr == nil {
+		return
+	}
+	if a.ctx != nil {
+		a.ctx.SetToolResult(fr.CallID, "CANCELLED")
+	}
+	for i := range a.pending {
+		if a.pending[i].id == fr.CallID {
+			a.pending[i].done = true
+			a.pending[i].cancelled = true
+		}
+	}
+	a.suppressFollowUp = true
 }
 
 func appendSpoken(b *strings.Builder, text string) {

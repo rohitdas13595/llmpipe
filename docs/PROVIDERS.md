@@ -90,6 +90,24 @@ Wiring is centralized in `[../providers/registry.go](../providers/registry.go)`.
 
 Set `GEMINI_LIVE_MODEL`, `OPENAI_REALTIME_MODEL`, and `OPENAI_API_KEY` as appropriate. Realtime modes **skip VAD** and text aggregators; audio goes straight to the realtime session.
 
+## Function calling
+
+`TOOLS=weather` registers one demo tool, `get_weather`, on whichever LLM the process builds (OpenAI-compatible chat including Groq and Azure, Anthropic, Gemini, OpenAI Realtime, and Gemini Live). The handler returns a canned forecast. The mic is muted while calls are in flight (`turns.FunctionCallMute`).
+
+Register your own tools on the same registry the service exposes as `SetRegistry`:
+
+```go
+reg := tools.NewRegistry()
+fn, h := tools.Typed("get_weather", "Current weather for a place.", func(ctx context.Context, a struct {
+    Location string `json:"location"`
+}) (any, error) {
+    return map[string]any{"location": a.Location, "condition": "sun"}, nil
+})
+reg.Register(fn, h) // cancel on interruption, 10s timeout
+```
+
+`LLMSetToolsFrame` carries a `tools.Schema` and replaces the declaration list sent on the next request. Handlers still come from the registry. A batch runs in parallel. Results are written into the typed context (assistant `tool_calls`, then one tool message per call) and one follow-up model request is made after the last result. Interruption cancels in-flight handlers, stores `CANCELLED`, and does not follow up.
+
 Additional Pipecat realtime modules (`xai/realtime`, `azure/realtime`, `grok/realtime`, `inworld/realtime`, …) are **not** implemented in llmpipe.
 
 

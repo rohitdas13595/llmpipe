@@ -23,7 +23,8 @@ Files in [`docs/`](docs/):
 - `frames` — frame types (`StartFrame`, `InputAudioRawFrame`, `TranscriptionFrame`, `LLMRunFrame`, `InterruptionFrame`, …)
 - `processor`, `pipeline` — `Pipeline`, `PipelineTask` (`QueueFrames`, `Reenter` / `ReenterAfter`), `Runner`
 - `observe` — `FrameObserver`, `IdleFrameObserver`
-- `aggregate` — `LLMContext`, user/assistant aggregators
+- `aggregate` — typed `LLMContext`, user/assistant aggregators
+- `processors/tools`, `adapters` — function calling (`TOOLS=weather` in the voice demo)
 - `audio/vad`, `audio/interrupt`, `audio/turn` (stub for smart-turn)
 - `services` — provider STT/LLM/TTS + realtime (`openai`, `google`, `anthropic`, `groq`, `whisper`, `assemblyai`, …); see [`docs/PROVIDERS.md`](docs/PROVIDERS.md) for parity with the Python [`pipecat`](../pipecat) tree
 - `providers` — env-based wiring (`providers.BuildSTT` / `BuildLLM` / `BuildTTS`, `PIPELINE=gemini_live|openai_realtime`)
@@ -58,6 +59,7 @@ Both `**cmd/voicebot**` and `**cmd/voicebot-livekit**` call `godotenv.Load()` at
 | `ANTHROPIC_API_KEY`, `ANTHROPIC_MODEL`      | Claude when `LLM=anthropic`                                                         |
 | `ASSEMBLYAI_API_KEY`                        | When `STT=assemblyai`                                                               |
 | `SYSTEM_PROMPT`                             | System message / realtime instructions                                             |
+| `TOOLS`                                     | Comma-separated demo tools. `weather` registers `get_weather` (canned forecast)    |
 
 
 Clients send **binary WebSocket messages** of **16-bit little-endian mono PCM**; bot replies with PCM chunks.

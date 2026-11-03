@@ -80,7 +80,7 @@ func BuildUserTurns() processor.Processor {
 			turns.MinWordsStart{N: 1, WhenBotSpeaking: true},
 		},
 		stop,
-		nil,
+		[]turns.MuteStrategy{&turns.FunctionCallMute{}},
 	)
 }
 
