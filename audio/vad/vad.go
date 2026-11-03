@@ -106,6 +106,10 @@ func NewProcessor(name string, a Analyzer) *Processor {
 func (p *Processor) Name() string { return p.name }
 
 func (p *Processor) Process(ctx context.Context, f frames.Frame, dir processor.Direction, emit processor.Emit) error {
+	if dir == processor.Upstream {
+		processor.Forward(dir, f, emit)
+		return nil
+	}
 	switch fr := f.(type) {
 	case *frames.InputAudioRawFrame:
 		st, sp := p.analyzer.Analyze(fr.Audio, fr.SampleRate)

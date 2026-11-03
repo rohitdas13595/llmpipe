@@ -160,9 +160,9 @@ func runVoiceSession(root context.Context, sessions *sessionSet, w http.Response
 			stt,
 			aggregate.NewUserAggregator("user.agg", ctxLLM, bot, strategy),
 			llm,
-			aggregate.NewAssistantAggregator("assistant", ctxLLM),
 			tts,
 			tr.Output(),
+			aggregate.NewAssistantAggregator("assistant", ctxLLM),
 		)
 	}
 

@@ -35,10 +35,18 @@ type Realtime struct {
 	services.Slot
 	started    atomic.Bool
 	mu         sync.Mutex
-	conn       *websocket.Conn
+	conn       realtimeSocket
 	recvCancel context.CancelFunc
 	inRate     int
-	voiceOut   bool // whether we already emitted BotSpeakingFrame for this turn
+	voiceOut   bool
+	itemID     string
+}
+
+// realtimeSocket is the subset of *websocket.Conn the session uses.
+type realtimeSocket interface {
+	WriteJSON(v any) error
+	ReadMessage() (messageType int, p []byte, err error)
+	Close() error
 }
 
 func NewRealtime(name, apiKey, model, system string, re services.ReenterFunc, bot *aggregate.BotState) *Realtime {
@@ -86,6 +94,27 @@ func (r *Realtime) ensure(ctx context.Context) {
 
 func (r *Realtime) Process(ctx context.Context, f frames.Frame, dir processor.Direction, emit processor.Emit) error {
 	switch fr := f.(type) {
+	case *frames.BotStartedSpeakingFrame, *frames.BotSpeakingFrame:
+		if r.Bot != nil {
+			r.Bot.SetSpeaking(true)
+		}
+		processor.Forward(dir, f, emit)
+		return nil
+	case *frames.BotStoppedSpeakingFrame:
+		if r.Bot != nil {
+			r.Bot.SetSpeaking(false)
+		}
+		if fr.Interrupted {
+			r.truncate(fr.PlayedMS)
+		}
+		processor.Forward(dir, f, emit)
+		return nil
+	}
+	if dir == processor.Upstream {
+		processor.Forward(dir, f, emit)
+		return nil
+	}
+	switch fr := f.(type) {
 	case *frames.StartFrame:
 		r.inRate = fr.SampleRate
 		if r.inRate <= 0 {
@@ -119,13 +148,48 @@ func (r *Realtime) Process(ctx context.Context, f frames.Frame, dir processor.Di
 			"audio": b64,
 		}
 		_ = c.WriteJSON(msg)
-	case *frames.InterruptionFrame, *frames.CancelFrame, *frames.EndFrame:
+	case *frames.InterruptionFrame:
+		r.cancelResponse()
+		processor.Forward(dir, f, emit)
+	case *frames.CancelFrame, *frames.EndFrame:
 		r.closeConn()
-		emit.Down(f)
+		processor.Forward(dir, f, emit)
 	default:
-		emit.Down(f)
+		processor.Forward(dir, f, emit)
 	}
 	return nil
+}
+
+func (r *Realtime) sendJSON(v any) {
+	r.mu.Lock()
+	c := r.conn
+	r.mu.Unlock()
+	if c == nil {
+		return
+	}
+	_ = c.WriteJSON(v)
+}
+
+func (r *Realtime) cancelResponse() {
+	r.sendJSON(map[string]any{"type": "response.cancel"})
+}
+
+func (r *Realtime) truncate(playedMS int) {
+	r.mu.Lock()
+	id := r.itemID
+	r.mu.Unlock()
+	if id == "" {
+		return
+	}
+	if playedMS < 0 {
+		playedMS = 0
+	}
+	r.sendJSON(map[string]any{
+		"type":          "conversation.item.truncate",
+		"item_id":       id,
+		"content_index": 0,
+		"audio_end_ms":  playedMS,
+	})
 }
 
 func (r *Realtime) connect(bg context.Context) {
@@ -184,52 +248,45 @@ func (r *Realtime) readLoop(ctx context.Context, conn *websocket.Conn) {
 		if ctx.Err() != nil {
 			return
 		}
-		var ev map[string]json.RawMessage
-		if json.Unmarshal(data, &ev) != nil {
-			continue
-		}
-		tbytes, ok := ev["type"]
-		if !ok {
-			continue
-		}
-		var typ string
-		if json.Unmarshal(tbytes, &typ) != nil {
-			continue
-		}
-		if typ == "response.output_audio.delta" {
-			var delta string
-			if json.Unmarshal(ev["delta"], &delta) != nil {
-				continue
-			}
-			raw, err := base64.StdEncoding.DecodeString(delta)
-			if err != nil || len(raw) == 0 {
-				continue
-			}
+		r.handleServer(ctx, data)
+	}
+}
+
+func (r *Realtime) handleServer(ctx context.Context, data []byte) {
+	var ev struct {
+		Type   string `json:"type"`
+		Delta  string `json:"delta"`
+		ItemID string `json:"item_id"`
+	}
+	if json.Unmarshal(data, &ev) != nil {
+		return
+	}
+	switch ev.Type {
+	case "response.output_audio.delta", "response.audio.delta":
+		if ev.ItemID != "" {
 			r.mu.Lock()
-			first := !r.voiceOut
-			if first {
-				r.voiceOut = true
-			}
+			r.itemID = ev.ItemID
 			r.mu.Unlock()
-			if r.Bot != nil {
-				r.Bot.SetSpeaking(true)
-			}
-			if first {
-				_ = r.push(ctx, &frames.BotSpeakingFrame{})
-			}
-			_ = r.push(ctx, &frames.TTSAudioRawFrame{
-				Audio: raw, SampleRate: openAIRealtimeInputRate, NumChannels: 1,
-			})
 		}
-		if typ == "response.output_audio.done" {
-			r.mu.Lock()
-			r.voiceOut = false
-			r.mu.Unlock()
-			_ = r.push(ctx, &frames.BotStoppedSpeakingFrame{})
-			if r.Bot != nil {
-				r.Bot.SetSpeaking(false)
-			}
+		raw, err := base64.StdEncoding.DecodeString(ev.Delta)
+		if err != nil || len(raw) == 0 {
+			return
 		}
+		r.mu.Lock()
+		first := !r.voiceOut
+		r.voiceOut = true
+		r.mu.Unlock()
+		if first {
+			_ = r.push(ctx, &frames.TTSStartedFrame{})
+		}
+		_ = r.push(ctx, &frames.TTSAudioRawFrame{
+			Audio: raw, SampleRate: openAIRealtimeInputRate, NumChannels: 1,
+		})
+	case "response.output_audio.done", "response.audio.done":
+		r.mu.Lock()
+		r.voiceOut = false
+		r.mu.Unlock()
+		_ = r.push(ctx, &frames.TTSStoppedFrame{})
 	}
 }
 

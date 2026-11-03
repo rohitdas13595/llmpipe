@@ -88,6 +88,10 @@ func NewTTSServiceWithBaseURL(name, apiKey, baseURL, model, voice string, bot *a
 func (t *TTSService) Name() string { return t.name }
 
 func (t *TTSService) Process(ctx context.Context, f frames.Frame, dir processor.Direction, emit processor.Emit) error {
+	if dir == processor.Upstream {
+		processor.Forward(dir, f, emit)
+		return nil
+	}
 	switch fr := f.(type) {
 	case *frames.LLMFullResponseStartFrame:
 		t.mu.Lock()
@@ -187,13 +191,5 @@ func (t *TTSService) speak(ctx context.Context, emit processor.Emit, text string
 		pcm = resample.LinearS16LE(pcm, openAITTSRate, t.SampleRate)
 	}
 	services.PipelineLog("tts", "openai: pcm %d bytes → %d Hz", len(pcm), t.SampleRate)
-	if t.Bot != nil {
-		t.Bot.SetSpeaking(true)
-	}
-	emit.Down(&frames.BotSpeakingFrame{})
-	emit.Down(&frames.TTSAudioRawFrame{Audio: pcm, SampleRate: t.SampleRate, NumChannels: 1})
-	emit.Down(&frames.BotStoppedSpeakingFrame{})
-	if t.Bot != nil {
-		t.Bot.SetSpeaking(false)
-	}
+	services.EmitTTS(emit, text, pcm, t.SampleRate)
 }

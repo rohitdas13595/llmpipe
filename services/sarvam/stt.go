@@ -22,6 +22,10 @@ func NewSTT(name string, reenter services.ReenterFunc) *STT {
 func (s *STT) Name() string { return s.name }
 
 func (s *STT) Process(ctx context.Context, f frames.Frame, dir processor.Direction, emit processor.Emit) error {
+	if dir == processor.Upstream {
+		processor.Forward(dir, f, emit)
+		return nil
+	}
 	emit.Down(f)
 	return nil
 }

@@ -37,7 +37,15 @@ const (
 	KindTurnStarted            = "TurnStarted"
 	KindTurnEnded              = "TurnEnded"
 	KindTransportMessage       = "TransportMessage"
+	KindTTSStarted             = "TTSStarted"
+	KindTTSStopped             = "TTSStopped"
+	KindTTSText                = "TTSText"
+	KindOutputTransportMessage = "OutputTransportMessage"
+	KindOutputTransportUrgent  = "OutputTransportMessageUrgent"
 )
+
+// TransportClearPayload is the client message that drops queued playback.
+const TransportClearPayload = `{"type":"clear"}`
 
 type StartFrame struct {
 	SampleRate  int
@@ -148,8 +156,8 @@ type InterruptionFrame struct {
 func (f *InterruptionFrame) FrameKind() string { return KindInterruption }
 
 // InterruptionTaskFrame is pushed upstream to request a pipeline-wide
-// interruption. The task turns it into a downstream InterruptionFrame at the
-// source. Broadcasting and output clearing are phase 2.
+// interruption. The source turns it into one downstream InterruptionFrame
+// that every node observes. Outputs clear buffered audio when they see it.
 type InterruptionTaskFrame struct {
 	System
 	Meta
@@ -211,6 +219,11 @@ type BotStartedSpeakingFrame struct {
 func (f *BotStartedSpeakingFrame) FrameKind() string { return KindBotStartedSpeaking }
 
 type BotStoppedSpeakingFrame struct {
+	// PlayedMS is how many milliseconds of audio the listener had heard when
+	// playback stopped. Outputs set it; realtime services use it to truncate.
+	PlayedMS int
+	// Interrupted is set when playback stopped because of a barge-in.
+	Interrupted bool
 	System
 	Meta
 }

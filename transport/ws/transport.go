@@ -12,6 +12,7 @@ import (
 
 	"github.com/rohitdas13595/llmpipe/frames"
 	"github.com/rohitdas13595/llmpipe/processor"
+	"github.com/rohitdas13595/llmpipe/transport/base"
 )
 
 // Transport serves browser/raw PCM clients (16-bit LE mono).
@@ -49,34 +50,43 @@ func (t *Transport) Input() processor.Processor {
 	}
 }
 
-// Output writes TTSAudioRawFrame to the active WebSocket as binary messages.
+// Output paces TTS audio onto the WebSocket and sends {"type":"clear"} when
+// the pipeline is interrupted.
 func (t *Transport) Output() processor.Processor {
-	return &wsOutput{t: t}
+	get := func() *websocket.Conn {
+		t.mu.RLock()
+		defer t.mu.RUnlock()
+		return t.conn
+	}
+	w := base.NewWSWriter(get)
+	ao := &base.AudioOutput{
+		SampleRate: t.SampleRate,
+		Write:      w.Write,
+		Clear:      w.Clear,
+	}
+	return &wsOutput{ao: ao, w: w}
 }
 
 type wsOutput struct {
-	t *Transport
+	ao *base.AudioOutput
+	w  *base.WSWriter
 }
 
 func (o *wsOutput) Name() string { return "ws.output" }
 
-func (o *wsOutput) Process(ctx context.Context, f frames.Frame, dir processor.Direction, emit processor.Emit) error {
-	if a, ok := f.(*frames.TTSAudioRawFrame); ok {
-		// Serialize writes; concurrent WriteMessage is unsafe on gorilla/websocket.
-		o.t.mu.Lock()
-		c := o.t.conn
-		if c != nil {
-			if err := c.WriteMessage(websocket.BinaryMessage, a.Audio); err != nil {
-				o.t.mu.Unlock()
-				emit.Down(&frames.ErrorFrame{Err: err})
-				emit.Down(f)
-				return nil
-			}
-		}
-		o.t.mu.Unlock()
-	}
-	emit.Down(f)
+func (o *wsOutput) Setup(ctx context.Context, h processor.Handle) error {
+	o.ao.Start(ctx, h)
 	return nil
+}
+
+func (o *wsOutput) Cleanup(context.Context) error {
+	o.ao.Stop()
+	o.w.Stop()
+	return nil
+}
+
+func (o *wsOutput) Process(ctx context.Context, f frames.Frame, dir processor.Direction, emit processor.Emit) error {
+	return o.ao.Handle(f, dir, emit)
 }
 
 // Upgrader is used by HandleWebSocket.

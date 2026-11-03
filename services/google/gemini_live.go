@@ -103,13 +103,33 @@ func (g *GeminiLive) Process(ctx context.Context, f frames.Frame, dir processor.
 		_ = sess.SendRealtimeInput(genai.LiveRealtimeInput{
 			Audio: &genai.Blob{MIMEType: mime, Data: fr.Audio},
 		})
-	case *frames.InterruptionFrame, *frames.CancelFrame, *frames.EndFrame:
+	case *frames.BotStartedSpeakingFrame, *frames.BotSpeakingFrame:
+		if g.Bot != nil {
+			g.Bot.SetSpeaking(true)
+		}
+		processor.Forward(dir, f, emit)
+	case *frames.BotStoppedSpeakingFrame:
+		if g.Bot != nil {
+			g.Bot.SetSpeaking(false)
+		}
+		processor.Forward(dir, f, emit)
+	case *frames.InterruptionFrame:
+		processor.Forward(dir, f, emit)
+	case *frames.CancelFrame, *frames.EndFrame:
 		g.shutdown()
-		emit.Down(f)
+		processor.Forward(dir, f, emit)
 	default:
-		emit.Down(f)
+		processor.Forward(dir, f, emit)
 	}
 	return nil
+}
+
+// signalInterruption asks the source to broadcast one InterruptionFrame so
+// outputs drop buffered audio. The live socket stays up.
+func (g *GeminiLive) signalInterruption(ctx context.Context) {
+	if err := services.PushUp(ctx, g.H(), g.name, &frames.InterruptionTaskFrame{}); err != nil {
+		services.PipelineLog("realtime", "gemini live interruption: %v", err)
+	}
 }
 
 func (g *GeminiLive) connect(bg context.Context) {
@@ -168,7 +188,7 @@ func (g *GeminiLive) receiveLoop(ctx context.Context, sess *genai.Session) {
 			continue
 		}
 		if msg.ServerContent != nil && msg.ServerContent.Interrupted {
-			_ = g.push(ctx, &frames.InterruptionFrame{})
+			g.signalInterruption(ctx)
 		}
 		if msg.ServerContent != nil && msg.ServerContent.ModelTurn != nil {
 			for _, p := range msg.ServerContent.ModelTurn.Parts {
@@ -186,15 +206,7 @@ func (g *GeminiLive) receiveLoop(ctx context.Context, sess *genai.Session) {
 						rate = n
 					}
 				}
-				if g.Bot != nil {
-					g.Bot.SetSpeaking(true)
-				}
-				_ = g.push(ctx, &frames.BotSpeakingFrame{})
 				_ = g.push(ctx, &frames.TTSAudioRawFrame{Audio: d, SampleRate: rate, NumChannels: 1})
-				_ = g.push(ctx, &frames.BotStoppedSpeakingFrame{})
-				if g.Bot != nil {
-					g.Bot.SetSpeaking(false)
-				}
 			}
 		}
 	}

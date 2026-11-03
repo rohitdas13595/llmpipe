@@ -11,6 +11,7 @@ func TestCategories(t *testing.T) {
 		&VADUserStartedSpeakingFrame{}, &VADUserStoppedSpeakingFrame{},
 		&BotStartedSpeakingFrame{}, &BotStoppedSpeakingFrame{}, &BotSpeakingFrame{},
 		&TurnStartedFrame{}, &TurnEndedFrame{},
+		&TTSTextFrame{}, &OutputTransportMessageUrgentFrame{},
 	}
 	for _, f := range system {
 		if !IsSystem(f) || Interruptible(f) {
@@ -20,6 +21,7 @@ func TestCategories(t *testing.T) {
 	control := []Frame{
 		&EndFrame{}, &LLMFullResponseStartFrame{}, &LLMFullResponseEndFrame{},
 		&LLMSetToolsFrame{}, &LLMRunFrame{},
+		&TTSStartedFrame{}, &TTSStoppedFrame{},
 	}
 	for _, f := range control {
 		if !IsControl(f) || IsSystem(f) {
@@ -36,6 +38,7 @@ func TestCategories(t *testing.T) {
 		&TextFrame{}, &LLMTextFrame{}, &TTSAudioRawFrame{},
 		&TranscriptionFrame{}, &InterimTranscriptionFrame{},
 		&LLMMessagesAppendFrame{}, &TransportMessageFrame{},
+		&OutputTransportMessageFrame{},
 	}
 	for _, f := range data {
 		if IsSystem(f) || IsControl(f) || !Interruptible(f) {

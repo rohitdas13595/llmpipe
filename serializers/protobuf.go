@@ -40,6 +40,12 @@ func (Protobuf) Serialize(f frames.Frame) ([]byte, error) {
 		wrap.Frame = &pipecatpb.Frame_Transcription{Transcription: &pipecatpb.TranscriptionFrame{Text: fr.Text}}
 	case *frames.TransportMessageFrame:
 		wrap.Frame = &pipecatpb.Frame_Message{Message: &pipecatpb.MessageFrame{Data: fr.Data}}
+	case *frames.OutputTransportMessageFrame:
+		wrap.Frame = &pipecatpb.Frame_Message{Message: &pipecatpb.MessageFrame{Data: fr.Data}}
+	case *frames.OutputTransportMessageUrgentFrame:
+		// Urgent is pipeline priority. On the wire it is the same MessageFrame,
+		// which is how a clear payload reaches protobuf clients.
+		wrap.Frame = &pipecatpb.Frame_Message{Message: &pipecatpb.MessageFrame{Data: fr.Data}}
 	default:
 		return nil, unsupportedType(f)
 	}

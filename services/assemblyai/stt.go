@@ -25,11 +25,12 @@ import (
 
 // STT uploads WAV after each utterance and polls for the transcript.
 type STT struct {
-	name       string
-	APIKey     string
-	SampleRate int
-	Reenter    services.ReenterFunc
-	Bot        *aggregate.BotState
+	name                 string
+	APIKey               string
+	SampleRate           int
+	Reenter              services.ReenterFunc
+	Bot                  *aggregate.BotState
+	MuteWhileBotSpeaking bool
 
 	services.Slot
 	mu  sync.Mutex
@@ -45,11 +46,19 @@ func NewSTT(name, apiKey string, reenter services.ReenterFunc, sampleRate int, b
 
 func (s *STT) Name() string { return s.name }
 
+func (s *STT) dropEcho() bool {
+	return s.MuteWhileBotSpeaking && s.Bot != nil && s.Bot.Speaking()
+}
+
 func (s *STT) push(ctx context.Context, f frames.Frame) error {
 	return services.PushDown(ctx, s.H(), s.Reenter, s.name, f)
 }
 
 func (s *STT) Process(ctx context.Context, f frames.Frame, dir processor.Direction, emit processor.Emit) error {
+	if dir == processor.Upstream {
+		processor.Forward(dir, f, emit)
+		return nil
+	}
 	switch fr := f.(type) {
 	case *frames.UserStartedSpeakingFrame:
 		s.mu.Lock()
@@ -58,14 +67,14 @@ func (s *STT) Process(ctx context.Context, f frames.Frame, dir processor.Directi
 		emit.Down(f)
 	case *frames.InputAudioRawFrame:
 		s.mu.Lock()
-		if s.Bot == nil || !s.Bot.Speaking() {
+		if !s.dropEcho() {
 			s.buf.Write(fr.Audio)
 		}
 		s.mu.Unlock()
 		emit.Down(f)
 	case *frames.UserStoppedSpeakingFrame:
 		emit.Down(f)
-		if s.Bot != nil && s.Bot.Speaking() {
+		if s.dropEcho() {
 			s.mu.Lock()
 			s.buf.Reset()
 			s.mu.Unlock()

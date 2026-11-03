@@ -101,6 +101,6 @@ func (u *UserProcessor) Process(ctx context.Context, f frames.Frame, dir process
 			u.armTimer()
 		}
 	}
-	emit.Down(f)
+	processor.Forward(dir, f, emit)
 	return nil
 }

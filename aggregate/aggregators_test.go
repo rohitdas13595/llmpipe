@@ -1,8 +1,11 @@
 package aggregate
 
 import (
+	"bytes"
 	"context"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/rohitdas13595/llmpipe/audio/interrupt"
 	"github.com/rohitdas13595/llmpipe/frames"
@@ -103,6 +106,113 @@ func TestAssistantAggregatorStreamsTextAndCommits(t *testing.T) {
 	msgs := ctxBag.Snapshot()
 	if len(msgs) != 1 || msgs[0]["role"] != "assistant" || msgs[0]["content"] != "hello" {
 		t.Fatalf("assistant context = %#v", msgs)
+	}
+}
+
+func TestUserInterimInterruptReachesTailOnce(t *testing.T) {
+	ctxBag := NewLLMContext("")
+	bot := NewBotState()
+	bot.SetSpeaking(true)
+	u := NewUserAggregator("ua", ctxBag, bot, interrupt.MinWords{N: 1})
+	var interrupts int
+	tail := processor.Func{
+		N: "tail",
+		F: func(ctx context.Context, f frames.Frame, dir processor.Direction, emit processor.Emit) error {
+			if _, ok := f.(*frames.InterruptionFrame); ok {
+				interrupts++
+			}
+			return nil
+		},
+	}
+	task := pipeline.NewPipelineTask(pipeline.NewPipeline(u, tail))
+	pipelinetest.UntilEnd(t, task, func() {
+		if err := task.QueueFrames(context.Background(), []frames.Frame{
+			&frames.InterimTranscriptionFrame{Text: "hey"},
+		}); err != nil {
+			t.Fatal(err)
+		}
+	})
+	if interrupts != 1 {
+		t.Fatalf("interruptions = %d, want 1", interrupts)
+	}
+}
+
+func TestUserVADInterruptAfter300ms(t *testing.T) {
+	bot := NewBotState()
+	bot.SetSpeaking(true)
+	u := NewUserAggregator("ua", NewLLMContext(""), bot, interrupt.MinWords{N: 1})
+	var interrupts atomic.Int32
+	tail := processor.Func{
+		N: "tail",
+		F: func(ctx context.Context, f frames.Frame, dir processor.Direction, emit processor.Emit) error {
+			if _, ok := f.(*frames.InterruptionFrame); ok {
+				interrupts.Add(1)
+			}
+			return nil
+		},
+	}
+	task := pipeline.NewPipelineTask(pipeline.NewPipeline(u, tail))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- task.Run(ctx) }()
+	deadline := time.Now().Add(2 * time.Second)
+	for !task.Running() {
+		if time.Now().After(deadline) {
+			t.Fatal("task did not start")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	audio := bytes.Repeat([]byte{1, 0}, 16000*200/1000)
+	if err := task.QueueFrames(context.Background(), []frames.Frame{
+		&frames.UserStartedSpeakingFrame{},
+		&frames.InputAudioRawFrame{Audio: audio, SampleRate: 16000, NumChannels: 1},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(50 * time.Millisecond)
+	if interrupts.Load() != 0 {
+		t.Fatalf("interrupted before 300ms: %d", interrupts.Load())
+	}
+	if err := task.QueueFrame(context.Background(), &frames.InputAudioRawFrame{Audio: audio, SampleRate: 16000, NumChannels: 1}); err != nil {
+		t.Fatal(err)
+	}
+	deadline = time.Now().Add(2 * time.Second)
+	for interrupts.Load() != 1 {
+		if time.Now().After(deadline) {
+			t.Fatalf("interrupts = %d", interrupts.Load())
+		}
+		time.Sleep(time.Millisecond)
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("stop")
+	}
+}
+
+func TestAssistantInterruptCommitsPlayedSentence(t *testing.T) {
+	ctxBag := NewLLMContext("")
+	a := NewAssistantAggregator("asst", ctxBag)
+	emit := processor.Emit{Down: func(frames.Frame) {}, Up: func(frames.Frame) {}}
+	ctx := context.Background()
+	steps := []frames.Frame{
+		&frames.LLMFullResponseStartFrame{},
+		&frames.LLMTextFrame{Text: "Hello there. And more words."},
+		&frames.TTSStartedFrame{},
+		&frames.TTSTextFrame{Text: "Hello there."},
+		&frames.InterruptionFrame{},
+		&frames.TTSTextFrame{Text: "And more words."},
+	}
+	for _, f := range steps {
+		if err := a.Process(ctx, f, processor.Downstream, emit); err != nil {
+			t.Fatal(err)
+		}
+	}
+	msgs := ctxBag.Snapshot()
+	if len(msgs) != 1 || msgs[0]["content"] != "Hello there." {
+		t.Fatalf("context = %#v", msgs)
 	}
 }
 

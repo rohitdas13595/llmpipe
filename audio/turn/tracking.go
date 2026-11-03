@@ -24,6 +24,10 @@ func NewTrackingProcessor(name string) *TrackingProcessor {
 func (t *TrackingProcessor) Name() string { return t.name }
 
 func (t *TrackingProcessor) Process(ctx context.Context, f frames.Frame, dir processor.Direction, emit processor.Emit) error {
+	if dir == processor.Upstream {
+		processor.Forward(dir, f, emit)
+		return nil
+	}
 	switch f.(type) {
 	case *frames.UserStartedSpeakingFrame:
 		t.turnIndex++

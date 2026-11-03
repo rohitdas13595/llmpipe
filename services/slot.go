@@ -49,6 +49,18 @@ func (s *Slot) TurnContext() context.Context {
 	return context.Background()
 }
 
+// PushUp enqueues f upstream. ReenterFunc only injects downstream, so a
+// missing handle is an error rather than a silent wrong-direction send.
+func PushUp(ctx context.Context, h processor.Handle, name string, f frames.Frame) error {
+	if h == nil {
+		return fmt.Errorf("%s: pipeline handle not configured", name)
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return h.PushFrameCtx(ctx, f, processor.Upstream)
+}
+
 // PushDown enqueues f downstream. A live Handle wins over the deprecated
 // ReenterFunc so Process is not called on the caller's goroutine.
 func PushDown(ctx context.Context, h processor.Handle, re ReenterFunc, name string, f frames.Frame) error {

@@ -17,12 +17,13 @@ import (
 // STT transcribes utterances with Gemini multimodal audio (Pipecat `pipecat/services/google/stt.py` uses Cloud Speech v2;
 // llmpipe uses the Gemini API with the same key as google/llm.go).
 type STT struct {
-	name       string
-	Client     *genai.Client
-	Model      string
-	SampleRate int
-	Reenter    services.ReenterFunc
-	Bot        *aggregate.BotState
+	name                 string
+	Client               *genai.Client
+	Model                string
+	SampleRate           int
+	Reenter              services.ReenterFunc
+	Bot                  *aggregate.BotState
+	MuteWhileBotSpeaking bool
 
 	services.Slot
 	mu  sync.Mutex
@@ -41,11 +42,19 @@ func NewSTT(name string, client *genai.Client, model string, reenter services.Re
 
 func (s *STT) Name() string { return s.name }
 
+func (s *STT) dropEcho() bool {
+	return s.MuteWhileBotSpeaking && s.Bot != nil && s.Bot.Speaking()
+}
+
 func (s *STT) push(ctx context.Context, f frames.Frame) error {
 	return services.PushDown(ctx, s.H(), s.Reenter, s.name, f)
 }
 
 func (s *STT) Process(ctx context.Context, f frames.Frame, dir processor.Direction, emit processor.Emit) error {
+	if dir == processor.Upstream {
+		processor.Forward(dir, f, emit)
+		return nil
+	}
 	switch fr := f.(type) {
 	case *frames.UserStartedSpeakingFrame:
 		s.mu.Lock()
@@ -54,14 +63,14 @@ func (s *STT) Process(ctx context.Context, f frames.Frame, dir processor.Directi
 		emit.Down(f)
 	case *frames.InputAudioRawFrame:
 		s.mu.Lock()
-		if s.Bot == nil || !s.Bot.Speaking() {
+		if !s.dropEcho() {
 			s.buf = append(s.buf, fr.Audio...)
 		}
 		s.mu.Unlock()
 		emit.Down(f)
 	case *frames.UserStoppedSpeakingFrame:
 		emit.Down(f)
-		if s.Bot != nil && s.Bot.Speaking() {
+		if s.dropEcho() {
 			s.mu.Lock()
 			s.buf = nil
 			s.mu.Unlock()
