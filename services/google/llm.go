@@ -40,6 +40,10 @@ func (l *LLM) push(ctx context.Context, f frames.Frame) error {
 }
 
 func (l *LLM) Process(ctx context.Context, f frames.Frame, dir processor.Direction, emit processor.Emit) error {
+	if dir == processor.Upstream {
+		processor.Forward(dir, f, emit)
+		return nil
+	}
 	switch f.(type) {
 	case *frames.InterruptionFrame, *frames.CancelFrame:
 		l.mu.Lock()

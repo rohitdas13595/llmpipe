@@ -146,7 +146,25 @@
       }
       log('serverUrl=' + serverUrl, 'i');
 
-      room = new Room({ adaptiveStream: true, dynacast: true });
+      room = new Room({
+        adaptiveStream: true,
+        dynacast: true,
+        audioCaptureDefaults: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true
+        }
+      });
+
+      room.on(RoomEvent.DataReceived, (payload) => {
+        let msg = null;
+        try { msg = JSON.parse(new TextDecoder().decode(payload)); } catch (e) { msg = null; }
+        if (msg && msg.type === 'clear') {
+          remoteAudio.pause();
+          remoteAudio.currentTime = 0;
+          log('clear — stopped queued playback', 'w');
+        }
+      });
 
       room.on(RoomEvent.TrackSubscribed, (track, _pub, participant) => {
         if (track.kind !== Track.Kind.Audio) return;

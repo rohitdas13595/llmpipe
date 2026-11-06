@@ -520,12 +520,18 @@ func (t *PipelineTask) onProc(n *node, q queued) {
 	var forwardedDown, forwardedUp bool
 	emit := processor.Emit{
 		Down: func(ff frames.Frame) {
+			if ff == nil {
+				return
+			}
 			if ff == q.frame {
 				forwardedDown = true
 			}
 			_ = t.deliverDown(n.ctx, n, ff, q.epoch, q.fanID, ctrlNone)
 		},
 		Up: func(ff frames.Frame) {
+			if ff == nil {
+				return
+			}
 			if ff == q.frame {
 				forwardedUp = true
 			}

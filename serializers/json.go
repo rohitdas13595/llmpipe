@@ -56,6 +56,12 @@ func (JSON) Serialize(f frames.Frame) ([]byte, error) {
 	case *frames.TransportMessageFrame:
 		env.Kind = "transport_message"
 		env.Data = fr.Data
+	case *frames.OutputTransportMessageFrame:
+		env.Kind = "output_transport_message"
+		env.Data = fr.Data
+	case *frames.OutputTransportMessageUrgentFrame:
+		env.Kind = "output_transport_message_urgent"
+		env.Data = fr.Data
 	case *frames.TurnStartedFrame:
 		env.Kind = "turn_started"
 		env.Index = fr.Index
@@ -107,6 +113,10 @@ func (JSON) Deserialize(b []byte) (frames.Frame, error) {
 		return &frames.InterimTranscriptionFrame{Text: env.Text}, nil
 	case "transport_message":
 		return &frames.TransportMessageFrame{Data: env.Data}, nil
+	case "output_transport_message":
+		return &frames.OutputTransportMessageFrame{Data: env.Data}, nil
+	case "output_transport_message_urgent":
+		return &frames.OutputTransportMessageUrgentFrame{Data: env.Data}, nil
 	case "turn_started":
 		return &frames.TurnStartedFrame{Index: env.Index}, nil
 	case "turn_ended":

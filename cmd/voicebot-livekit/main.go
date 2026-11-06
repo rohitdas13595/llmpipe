@@ -159,9 +159,9 @@ func main() {
 			stt,
 			userAgg,
 			llm,
-			asst,
 			tts,
 			tr.Output(),
+			asst,
 		)
 	}
 

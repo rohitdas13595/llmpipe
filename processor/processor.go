@@ -39,3 +39,19 @@ func (fn Func) Name() string { return fn.N }
 func (fn Func) Process(ctx context.Context, f frames.Frame, dir Direction, emit Emit) error {
 	return fn.F(ctx, f, dir, emit)
 }
+
+// Forward sends f along dir. A nil emit func drops the frame.
+func Forward(dir Direction, f frames.Frame, emit Emit) {
+	if f == nil {
+		return
+	}
+	if dir == Upstream {
+		if emit.Up != nil {
+			emit.Up(f)
+		}
+		return
+	}
+	if emit.Down != nil {
+		emit.Down(f)
+	}
+}

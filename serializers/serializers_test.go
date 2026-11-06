@@ -67,6 +67,34 @@ func TestProtobufTransportMessage(t *testing.T) {
 	}
 }
 
+func TestSerializersCarryClear(t *testing.T) {
+	urgent := &frames.OutputTransportMessageUrgentFrame{Data: frames.TransportClearPayload}
+	b, err := JSON{}.Serialize(urgent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := JSON{}.Deserialize(b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, ok := out.(*frames.OutputTransportMessageUrgentFrame)
+	if !ok || got.Data != frames.TransportClearPayload {
+		t.Fatalf("json clear = %#v", out)
+	}
+	pb, err := Protobuf{}.Serialize(urgent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoded, err := Protobuf{}.Deserialize(pb)
+	if err != nil {
+		t.Fatal(err)
+	}
+	msg, ok := decoded.(*frames.TransportMessageFrame)
+	if !ok || msg.Data != frames.TransportClearPayload {
+		t.Fatalf("protobuf clear = %#v", decoded)
+	}
+}
+
 func TestJSONRoundTrip(t *testing.T) {
 	var j JSON
 	cases := []frames.Frame{

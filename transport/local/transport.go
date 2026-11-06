@@ -9,6 +9,7 @@ import (
 
 	"github.com/rohitdas13595/llmpipe/frames"
 	"github.com/rohitdas13595/llmpipe/processor"
+	"github.com/rohitdas13595/llmpipe/transport/base"
 )
 
 // Transport pumps PCM16 LE mono from In and writes TTS PCM to Out.
@@ -105,26 +106,39 @@ func (t *Transport) Input() processor.Processor {
 	}
 }
 
-// Output writes TTSAudioRawFrame bytes to Out.
+// Output paces TTS audio onto Out. Clear is a no-op: the writer has no
+// client jitter buffer of its own.
 func (t *Transport) Output() processor.Processor {
-	return &localOut{t: t}
+	ao := &base.AudioOutput{
+		SampleRate: t.SampleRate,
+		Write: func(b []byte) error {
+			if t.Out == nil || len(b) == 0 {
+				return nil
+			}
+			_, err := t.Out.Write(b)
+			return err
+		},
+		Clear: func() error { return nil },
+	}
+	return &localOut{ao: ao}
 }
 
 type localOut struct {
-	t *Transport
+	ao *base.AudioOutput
 }
 
 func (o *localOut) Name() string { return "local.output" }
 
-func (o *localOut) Process(ctx context.Context, f frames.Frame, dir processor.Direction, emit processor.Emit) error {
-	if a, ok := f.(*frames.TTSAudioRawFrame); ok {
-		if o.t.Out != nil && len(a.Audio) > 0 {
-			_, err := o.t.Out.Write(a.Audio)
-			if err != nil {
-				emit.Down(&frames.ErrorFrame{Err: err})
-			}
-		}
-	}
-	emit.Down(f)
+func (o *localOut) Setup(ctx context.Context, h processor.Handle) error {
+	o.ao.Start(ctx, h)
 	return nil
+}
+
+func (o *localOut) Cleanup(context.Context) error {
+	o.ao.Stop()
+	return nil
+}
+
+func (o *localOut) Process(ctx context.Context, f frames.Frame, dir processor.Direction, emit processor.Emit) error {
+	return o.ao.Handle(f, dir, emit)
 }

@@ -158,6 +158,8 @@
   let micOn = false;
   let nextPlayTime = 0;
   let pttActive = false;
+  /** @type {AudioBufferSourceNode[]} */
+  let playSources = [];
 
   function resampleFloat32(input, inputRate, outputRate) {
     if (inputRate === outputRate) return input;
@@ -216,8 +218,21 @@
     const src = ctx.createBufferSource();
     src.buffer = buffer;
     src.connect(ctx.destination);
+    src.onended = () => {
+      playSources = playSources.filter((s) => s !== src);
+    };
     src.start(start);
+    playSources.push(src);
     nextPlayTime = start + buffer.duration;
+  }
+
+  function clearPlayback() {
+    for (const src of playSources) {
+      try { src.stop(0); } catch (e) {}
+    }
+    playSources = [];
+    nextPlayTime = playCtx ? playCtx.currentTime : 0;
+    ttsChunks = 0;
   }
 
   function stopMic() {
@@ -257,7 +272,12 @@
     }
     stopMic();
     mediaStream = await navigator.mediaDevices.getUserMedia({
-      audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true },
+      audio: {
+        channelCount: 1,
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true
+      },
       video: false
     });
     captureCtx = new (window.AudioContext || window.webkitAudioContext)();
@@ -308,6 +328,15 @@
     };
     ws.onerror = () => log('WebSocket error.', 'e');
     ws.onmessage = (ev) => {
+      if (typeof ev.data === 'string') {
+        let msg = null;
+        try { msg = JSON.parse(ev.data); } catch (e) { msg = null; }
+        if (msg && msg.type === 'clear') {
+          clearPlayback();
+          log('clear — stopped queued playback', 'w');
+        }
+        return;
+      }
       if (ev.data instanceof ArrayBuffer) {
         const ctx = ensurePlayContext();
         if (ctx.state === 'suspended') {

@@ -15,6 +15,7 @@ import (
 
 	"github.com/rohitdas13595/llmpipe/frames"
 	"github.com/rohitdas13595/llmpipe/processor"
+	"github.com/rohitdas13595/llmpipe/transport/base"
 )
 
 // Transport connects as a bot participant, subscribes to the first remote Opus microphone,
@@ -203,31 +204,58 @@ func (t *Transport) Input() processor.Processor {
 	}
 }
 
-// Output writes TTSAudioRawFrame to the published PCM track.
+// Output paces TTS audio onto the published PCM track and clears the
+// LiveKit queue on interruption.
 func (t *Transport) Output() processor.Processor {
-	return &lkOutput{t: t}
+	ao := &base.AudioOutput{
+		SampleRate: t.SampleRate,
+		Write:      t.writePCM,
+		Clear:      t.clearPCM,
+	}
+	return &lkOutput{ao: ao}
+}
+
+func (t *Transport) writePCM(b []byte) error {
+	t.mu.RLock()
+	lt := t.localPCM
+	t.mu.RUnlock()
+	if lt == nil || len(b) < 2 {
+		return nil
+	}
+	n := len(b) / 2
+	samples := make(media.PCM16Sample, n)
+	for i := 0; i < n; i++ {
+		samples[i] = int16(binary.LittleEndian.Uint16(b[i*2:]))
+	}
+	return lt.WriteSample(samples)
+}
+
+func (t *Transport) clearPCM() error {
+	t.mu.RLock()
+	lt := t.localPCM
+	t.mu.RUnlock()
+	if lt != nil {
+		lt.ClearQueue()
+	}
+	return nil
 }
 
 type lkOutput struct {
-	t *Transport
+	ao *base.AudioOutput
 }
 
 func (o *lkOutput) Name() string { return "livekit.output" }
 
-func (o *lkOutput) Process(ctx context.Context, f frames.Frame, dir processor.Direction, emit processor.Emit) error {
-	if a, ok := f.(*frames.TTSAudioRawFrame); ok {
-		o.t.mu.RLock()
-		lt := o.t.localPCM
-		o.t.mu.RUnlock()
-		if lt != nil && len(a.Audio) >= 2 {
-			n := len(a.Audio) / 2
-			samples := make(media.PCM16Sample, n)
-			for i := 0; i < n; i++ {
-				samples[i] = int16(binary.LittleEndian.Uint16(a.Audio[i*2:]))
-			}
-			_ = lt.WriteSample(samples)
-		}
-	}
-	emit.Down(f)
+func (o *lkOutput) Setup(ctx context.Context, h processor.Handle) error {
+	o.ao.Start(ctx, h)
 	return nil
+}
+
+func (o *lkOutput) Cleanup(context.Context) error {
+	o.ao.Stop()
+	return nil
+}
+
+func (o *lkOutput) Process(ctx context.Context, f frames.Frame, dir processor.Direction, emit processor.Emit) error {
+	return o.ao.Handle(f, dir, emit)
 }

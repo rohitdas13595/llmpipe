@@ -44,6 +44,10 @@ func NewTTS(name, apiKey string, bot *aggregate.BotState, sampleRate int) *TTS {
 func (t *TTS) Name() string { return t.name }
 
 func (t *TTS) Process(ctx context.Context, f frames.Frame, dir processor.Direction, emit processor.Emit) error {
+	if dir == processor.Upstream {
+		processor.Forward(dir, f, emit)
+		return nil
+	}
 	switch fr := f.(type) {
 	case *frames.LLMFullResponseStartFrame:
 		t.mu.Lock()
@@ -117,19 +121,7 @@ func (t *TTS) speak(ctx context.Context, emit processor.Emit, text string, cance
 		return
 	}
 	services.PipelineLog("tts", "sarvam: synthesized %d bytes PCM (%d Hz) for %d chars", len(pcm), sr, len(text))
-	if t.Bot != nil {
-		t.Bot.SetSpeaking(true)
-	}
-	emit.Down(&frames.BotSpeakingFrame{})
-	emit.Down(&frames.TTSAudioRawFrame{
-		Audio:       pcm,
-		SampleRate:  sr,
-		NumChannels: 1,
-	})
-	emit.Down(&frames.BotStoppedSpeakingFrame{})
-	if t.Bot != nil {
-		t.Bot.SetSpeaking(false)
-	}
+	services.EmitTTS(emit, text, pcm, sr)
 }
 
 type ttsRequest struct {

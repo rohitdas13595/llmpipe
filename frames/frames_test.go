@@ -35,6 +35,11 @@ func TestFrameKinds(t *testing.T) {
 		{&UserStoppedSpeakingFrame{}, KindUserStoppedSpeaking},
 		{&BotStartedSpeakingFrame{}, KindBotStartedSpeaking},
 		{&BotStoppedSpeakingFrame{}, KindBotStoppedSpeaking},
+		{&TTSStartedFrame{}, KindTTSStarted},
+		{&TTSStoppedFrame{}, KindTTSStopped},
+		{&TTSTextFrame{}, KindTTSText},
+		{&OutputTransportMessageFrame{}, KindOutputTransportMessage},
+		{&OutputTransportMessageUrgentFrame{}, KindOutputTransportUrgent},
 	}
 	for _, tc := range tests {
 		if g := tc.f.FrameKind(); g != tc.want {
