@@ -4,7 +4,7 @@ The Python reference implementation lives in this repo under `[../pipecat/src/pi
 
 ## Classic pipeline (`PIPELINE` unset or `classic`)
 
-Chain: **VAD → STT → user agg → LLM → assistant agg → TTS** (see `cmd/voicebot` / `cmd/voicebot-livekit`).
+Chain: **VAD → turns → STT → user agg → LLM → TTS → output → assistant** (see `cmd/voicebot` / `cmd/voicebot-livekit`). `SILERO_MODEL` and `SMART_TURN_MODEL` select the ONNX models when the binary is built with `-tags onnx`.
 
 
 | Env `STT`            | Pipecat package                           | llmpipe implementation                                                                                |

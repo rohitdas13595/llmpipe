@@ -18,7 +18,6 @@ import (
 	"github.com/rohitdas13595/llmpipe/aggregate"
 	"github.com/rohitdas13595/llmpipe/audio/interrupt"
 	"github.com/rohitdas13595/llmpipe/audio/turn"
-	"github.com/rohitdas13595/llmpipe/audio/vad"
 	ex "github.com/rohitdas13595/llmpipe/examples"
 	"github.com/rohitdas13595/llmpipe/frames"
 	"github.com/rohitdas13595/llmpipe/observe"
@@ -90,20 +89,8 @@ func main() {
 
 	userAgg := aggregate.NewUserAggregator("user.agg", ctxLLM, bot, strategy)
 	asst := aggregate.NewAssistantAggregator("assistant", ctxLLM)
-	vadTh := 120.0
-	if v := os.Getenv("VAD_RMS_THRESHOLD"); v != "" {
-		if f, err := strconv.ParseFloat(v, 64); err == nil && f > 0 {
-			vadTh = f
-		}
-	}
-	vadAna := vad.NewEnergyAnalyzer(vadTh, envIntOr("VAD_MIN_SPEECH", 2), envIntOr("VAD_MIN_SILENCE", 6))
-	if v := os.Getenv("TURN_SILENCE_MS"); v != "" {
-		if ms, err := strconv.ParseFloat(v, 64); err == nil && ms > 0 {
-			vadAna.SilenceStopMS = ms
-			log.Printf("VAD: TURN_SILENCE_MS=%.0f (time-based end-of-user-turn)", ms)
-		}
-	}
-	vadP := vad.NewProcessor("vad", vadAna)
+	vadP := providers.BuildVAD(sampleRate)
+	userTurns := providers.BuildUserTurns()
 
 	userIdle := idle.NewUserProcessor("user.idle", time.Minute, func(retry int) bool {
 		log.Printf("user idle 1m — stop when the pipeline drains (retry=%d)", retry)
@@ -151,6 +138,7 @@ func main() {
 			userIdle,
 			tr.Input(),
 			vadP,
+			userTurns,
 		}
 		if providers.EnvOr("TURN_TRACK", "1") != "0" {
 			procs = append(procs, turn.NewTrackingProcessor("turn"))
@@ -252,13 +240,4 @@ func startLiveKitDemoServer(addr, livekitURL, defaultRoom, apiKey, apiSecret str
 	if err := http.ListenAndServe(addr, mux); err != nil {
 		log.Fatal("livekit demo http:", err)
 	}
-}
-
-func envIntOr(k string, def int) int {
-	if v := os.Getenv(k); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 {
-			return n
-		}
-	}
-	return def
 }

@@ -206,86 +206,34 @@ func TestAssistantAggregatorStreamsTextAndCommits(t *testing.T) {
 	}
 }
 
-func TestUserInterimInterruptReachesTailOnce(t *testing.T) {
+func TestUserAggregatorDoesNotInterrupt(t *testing.T) {
+	// Barge-in moved to turns.UserTurnProcessor. The aggregator must not
+	// ask for an interruption on its own.
 	ctxBag := NewLLMContext("")
 	bot := NewBotState()
 	bot.SetSpeaking(true)
 	u := NewUserAggregator("ua", ctxBag, bot, interrupt.MinWords{N: 1})
 	var interrupts int
-	tail := processor.Func{
-		N: "tail",
-		F: func(ctx context.Context, f frames.Frame, dir processor.Direction, emit processor.Emit) error {
+	emit := processor.Emit{
+		Down: func(f frames.Frame) {
 			if _, ok := f.(*frames.InterruptionFrame); ok {
 				interrupts++
 			}
-			return nil
 		},
-	}
-	task := pipeline.NewPipelineTask(pipeline.NewPipeline(u, tail))
-	pipelinetest.UntilEnd(t, task, func() {
-		if err := task.QueueFrames(context.Background(), []frames.Frame{
-			&frames.InterimTranscriptionFrame{Text: "hey"},
-		}); err != nil {
-			t.Fatal(err)
-		}
-	})
-	if interrupts != 1 {
-		t.Fatalf("interruptions = %d, want 1", interrupts)
-	}
-}
-
-func TestUserVADInterruptAfter300ms(t *testing.T) {
-	bot := NewBotState()
-	bot.SetSpeaking(true)
-	u := NewUserAggregator("ua", NewLLMContext(""), bot, interrupt.MinWords{N: 1})
-	var interrupts atomic.Int32
-	tail := processor.Func{
-		N: "tail",
-		F: func(ctx context.Context, f frames.Frame, dir processor.Direction, emit processor.Emit) error {
-			if _, ok := f.(*frames.InterruptionFrame); ok {
-				interrupts.Add(1)
+		Up: func(f frames.Frame) {
+			if _, ok := f.(*frames.InterruptionTaskFrame); ok {
+				interrupts++
 			}
-			return nil
 		},
 	}
-	task := pipeline.NewPipelineTask(pipeline.NewPipeline(u, tail))
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	done := make(chan error, 1)
-	go func() { done <- task.Run(ctx) }()
-	deadline := time.Now().Add(2 * time.Second)
-	for !task.Running() {
-		if time.Now().After(deadline) {
-			t.Fatal("task did not start")
-		}
-		time.Sleep(time.Millisecond)
-	}
-	audio := bytes.Repeat([]byte{1, 0}, 16000*200/1000)
-	if err := task.QueueFrames(context.Background(), []frames.Frame{
-		&frames.UserStartedSpeakingFrame{},
-		&frames.InputAudioRawFrame{Audio: audio, SampleRate: 16000, NumChannels: 1},
-	}); err != nil {
+	if err := u.Process(context.Background(), &frames.InterimTranscriptionFrame{Text: "hey"}, processor.Downstream, emit); err != nil {
 		t.Fatal(err)
 	}
-	time.Sleep(50 * time.Millisecond)
-	if interrupts.Load() != 0 {
-		t.Fatalf("interrupted before 300ms: %d", interrupts.Load())
-	}
-	if err := task.QueueFrame(context.Background(), &frames.InputAudioRawFrame{Audio: audio, SampleRate: 16000, NumChannels: 1}); err != nil {
-		t.Fatal(err)
-	}
-	deadline = time.Now().Add(2 * time.Second)
-	for interrupts.Load() != 1 {
-		if time.Now().After(deadline) {
-			t.Fatalf("interrupts = %d", interrupts.Load())
-		}
-		time.Sleep(time.Millisecond)
-	}
-	cancel()
-	select {
-	case <-done:
-	case <-time.After(3 * time.Second):
-		t.Fatal("stop")
+	audio := bytes.Repeat([]byte{1, 0}, 16000)
+	_ = u.Process(context.Background(), &frames.UserStartedSpeakingFrame{}, processor.Downstream, emit)
+	_ = u.Process(context.Background(), &frames.InputAudioRawFrame{Audio: audio, SampleRate: 16000}, processor.Downstream, emit)
+	if interrupts != 0 {
+		t.Fatalf("aggregator interruptions = %d, want 0", interrupts)
 	}
 }
 

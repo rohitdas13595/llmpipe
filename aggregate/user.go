@@ -11,8 +11,9 @@ import (
 	"github.com/rohitdas13595/llmpipe/services"
 )
 
-// DefaultVADInterrupt is how long user speech must last, while the bot is
-// speaking, before a barge-in is requested without a transcript.
+// DefaultVADInterrupt is the barge-in confirmation used by turns.VADStart.
+// The aggregator no longer applies it; the constant remains so callers that
+// read it keep compiling.
 const DefaultVADInterrupt = 300 * time.Millisecond
 
 // UserAggregatorParams controls how finals in one turn become a single LLM run.
@@ -31,28 +32,24 @@ const DefaultAggregationTimeout = 500 * time.Millisecond
 // UserAggregator appends transcriptions and triggers one LLM run per turn.
 // Finals that arrive while the user is still speaking are buffered. After the
 // user stops, the buffer is held for AggregationTimeout so a late final can
-// join the same user message. While the bot is speaking it asks the source
-// for one pipeline interruption, either from the word strategy (interim or
-// final) or after DefaultVADInterrupt of audio.
+// join the same user message. Barge-in is decided by turns.UserTurnProcessor,
+// which pushes InterruptionTaskFrame; this aggregator does not.
 type UserAggregator struct {
-	name     string
-	ctx      *LLMContext
-	bot      *BotState
-	strategy interrupt.Strategy
-	// VADInterrupt is the speech duration that counts as a barge-in when no
-	// transcript has arrived. Zero uses DefaultVADInterrupt. Negative disables
-	// the VAD path. NoInterrupt disables both paths.
+	name string
+	ctx  *LLMContext
+	bot  *BotState
+	// InterruptStrategy is accepted for compatibility and ignored.
+	InterruptStrategy interrupt.Strategy
+	// VADInterrupt is accepted for compatibility and ignored.
+	// turns.VADStart owns the barge-in confirmation.
 	VADInterrupt time.Duration
 
 	services.Slot
 
-	timeout     time.Duration
-	userSpeech  bool
-	speechFor   time.Duration
-	interrupted bool
-	pendingRun  bool
-	gen         int
-	buf         strings.Builder
+	timeout    time.Duration
+	userSpeech bool
+	gen        int
+	buf        strings.Builder
 }
 
 // turnReady is queued back onto this aggregator when the aggregation timer fires.
@@ -69,11 +66,11 @@ func NewUserAggregator(name string, c *LLMContext, bot *BotState, strategy inter
 		strategy = interrupt.MinWords{N: 1}
 	}
 	return &UserAggregator{
-		name:     name,
-		ctx:      c,
-		bot:      bot,
-		strategy: strategy,
-		timeout:  DefaultAggregationTimeout,
+		name:              name,
+		ctx:               c,
+		bot:               bot,
+		InterruptStrategy: strategy,
+		timeout:           DefaultAggregationTimeout,
 	}
 }
 
@@ -93,16 +90,14 @@ func (u *UserAggregator) Process(ctx context.Context, f frames.Frame, dir proces
 	case *frames.BotStoppedSpeakingFrame:
 		u.setSpeaking(false)
 		processor.Forward(dir, f, emit)
-	case *frames.UserStartedSpeakingFrame, *frames.VADUserStartedSpeakingFrame:
+	case *frames.UserStartedSpeakingFrame:
 		if u.buf.Len() > 0 {
 			u.emitRun(emit)
 		}
 		u.userSpeech = true
-		u.speechFor = 0
 		processor.Forward(dir, f, emit)
-	case *frames.UserStoppedSpeakingFrame, *frames.VADUserStoppedSpeakingFrame:
+	case *frames.UserStoppedSpeakingFrame:
 		u.userSpeech = false
-		u.speechFor = 0
 		processor.Forward(dir, f, emit)
 		u.arm(emit)
 	case *turnReady:
@@ -110,11 +105,7 @@ func (u *UserAggregator) Process(ctx context.Context, f frames.Frame, dir proces
 			return nil
 		}
 		u.emitRun(emit)
-	case *frames.InputAudioRawFrame:
-		u.noteAudio(fr, emit)
-		processor.Forward(dir, f, emit)
 	case *frames.InterimTranscriptionFrame:
-		u.maybeText(fr.Text, emit)
 		processor.Forward(dir, f, emit)
 	case *frames.TranscriptionFrame:
 		if strings.TrimSpace(fr.Text) == "" {
@@ -122,20 +113,10 @@ func (u *UserAggregator) Process(ctx context.Context, f frames.Frame, dir proces
 			return nil
 		}
 		u.append(fr.Text)
-		if u.maybeText(fr.Text, emit) {
-			u.pendingRun = true
-			return nil
-		}
 		if u.userSpeech {
 			return nil
 		}
 		u.arm(emit)
-	case *frames.InterruptionFrame:
-		processor.Forward(dir, f, emit)
-		if u.pendingRun && dir != processor.Upstream {
-			u.pendingRun = false
-			u.emitRun(emit)
-		}
 	default:
 		processor.Forward(dir, f, emit)
 	}
@@ -147,56 +128,7 @@ func (u *UserAggregator) setSpeaking(v bool) {
 		u.bot.SetSpeaking(v)
 	}
 	if !v {
-		u.interrupted = false
 		u.userSpeech = false
-		u.speechFor = 0
-	}
-}
-
-func (u *UserAggregator) allow() bool {
-	_, no := u.strategy.(interrupt.NoInterrupt)
-	return !no
-}
-
-func (u *UserAggregator) vadGate() time.Duration {
-	if u.VADInterrupt < 0 {
-		return -1
-	}
-	if u.VADInterrupt == 0 {
-		return DefaultVADInterrupt
-	}
-	return u.VADInterrupt
-}
-
-func (u *UserAggregator) maybeText(text string, emit processor.Emit) bool {
-	if !u.allow() || u.interrupted || u.bot == nil || !u.bot.Speaking() {
-		return false
-	}
-	if !u.strategy.ShouldInterrupt(text, true) {
-		return false
-	}
-	u.ask(emit)
-	return true
-}
-
-func (u *UserAggregator) noteAudio(fr *frames.InputAudioRawFrame, emit processor.Emit) {
-	if !u.userSpeech || !u.allow() || u.interrupted || u.bot == nil || !u.bot.Speaking() {
-		return
-	}
-	gate := u.vadGate()
-	if gate < 0 {
-		return
-	}
-	sr := fr.SampleRate
-	if sr <= 0 {
-		sr = 16000
-	}
-	if len(fr.Audio) < 2 {
-		return
-	}
-	u.speechFor += time.Duration(len(fr.Audio)/2) * time.Second / time.Duration(sr)
-	if u.speechFor >= gate {
-		u.ask(emit)
 	}
 }
 
@@ -243,15 +175,5 @@ func (u *UserAggregator) emitRun(emit processor.Emit) {
 	services.PipelineLog("pipeline", "%s: transcript OK → LLM run (%q)", u.name, text)
 	if emit.Down != nil {
 		emit.Down(&frames.LLMRunFrame{})
-	}
-}
-
-func (u *UserAggregator) ask(emit processor.Emit) {
-	if u.interrupted {
-		return
-	}
-	u.interrupted = true
-	if emit.Up != nil {
-		emit.Up(&frames.InterruptionTaskFrame{})
 	}
 }
