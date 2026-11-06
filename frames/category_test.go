@@ -12,6 +12,7 @@ func TestCategories(t *testing.T) {
 		&BotStartedSpeakingFrame{}, &BotStoppedSpeakingFrame{}, &BotSpeakingFrame{},
 		&TurnStartedFrame{}, &TurnEndedFrame{},
 		&TTSTextFrame{}, &OutputTransportMessageUrgentFrame{},
+		&FunctionCallsStartedFrame{}, &FunctionCallCancelFrame{},
 	}
 	for _, f := range system {
 		if !IsSystem(f) || Interruptible(f) {
@@ -22,6 +23,7 @@ func TestCategories(t *testing.T) {
 		&EndFrame{}, &LLMFullResponseStartFrame{}, &LLMFullResponseEndFrame{},
 		&LLMSetToolsFrame{}, &LLMRunFrame{},
 		&TTSStartedFrame{}, &TTSStoppedFrame{},
+		&FunctionCallInProgressFrame{},
 	}
 	for _, f := range control {
 		if !IsControl(f) || IsSystem(f) {
@@ -31,8 +33,8 @@ func TestCategories(t *testing.T) {
 	if Interruptible(&EndFrame{}) {
 		t.Fatal("End is uninterruptible")
 	}
-	if Interruptible(&FunctionCallResultFrame{}) {
-		t.Fatal("function result is uninterruptible")
+	if Interruptible(&FunctionCallResultFrame{}) || Interruptible(&FunctionCallInProgressFrame{}) {
+		t.Fatal("function frames are uninterruptible")
 	}
 	data := []Frame{
 		&TextFrame{}, &LLMTextFrame{}, &TTSAudioRawFrame{},

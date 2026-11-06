@@ -13,10 +13,13 @@ import (
 	"strings"
 	"sync"
 
+	oa "github.com/rohitdas13595/llmpipe/adapters/openai"
 	"github.com/rohitdas13595/llmpipe/aggregate"
 	"github.com/rohitdas13595/llmpipe/frames"
 	"github.com/rohitdas13595/llmpipe/processor"
+	"github.com/rohitdas13595/llmpipe/processors/tools"
 	"github.com/rohitdas13595/llmpipe/services"
+	"github.com/rohitdas13595/llmpipe/services/llmbase"
 )
 
 // LLM streams chat completions via the OpenAI-compatible Chat Completions API
@@ -31,6 +34,7 @@ type LLM struct {
 	Ctx        *aggregate.LLMContext
 	Reenter    services.ReenterFunc
 	httpClient *http.Client
+	tools      *llmbase.Bag
 
 	services.Slot
 	mu     sync.Mutex
@@ -53,6 +57,7 @@ func NewLLM(name, apiKey, model string, c *aggregate.LLMContext, reenter service
 		Ctx:        c,
 		Reenter:    reenter,
 		httpClient: http.DefaultClient,
+		tools:      &llmbase.Bag{},
 	}
 }
 
@@ -72,21 +77,40 @@ func NewLLMWithBaseURL(name, apiKey, baseURL, model string, c *aggregate.LLMCont
 		Ctx:        c,
 		Reenter:    re,
 		httpClient: http.DefaultClient,
+		tools:      &llmbase.Bag{},
 	}
 }
 
 func (l *LLM) Name() string { return l.name }
+
+// SetRegistry installs function handlers. The same registry serves Groq, Azure,
+// and the other OpenAI-compatible backends because they share this client.
+func (l *LLM) SetRegistry(r *tools.Registry) {
+	if l.tools == nil {
+		l.tools = &llmbase.Bag{}
+	}
+	l.tools.SetRegistry(r)
+}
 
 func (l *LLM) push(ctx context.Context, f frames.Frame) error {
 	return services.PushDown(ctx, l.H(), l.Reenter, l.name, f)
 }
 
 func (l *LLM) Process(ctx context.Context, f frames.Frame, dir processor.Direction, emit processor.Emit) error {
+	if _, ok := f.(*frames.LLMRunFrame); ok {
+		if l.H() == nil && l.Reenter == nil {
+			emit.Down(&frames.ErrorFrame{Err: fmt.Errorf("openai: pipeline handle not configured")})
+			return nil
+		}
+		services.PipelineLog("llm", "%s: LLMRunFrame → starting chat completion", l.name)
+		go l.runCompletion(l.TurnContext())
+		return nil
+	}
 	if dir == processor.Upstream {
 		processor.Forward(dir, f, emit)
 		return nil
 	}
-	switch f.(type) {
+	switch fr := f.(type) {
 	case *frames.StartFrame, *frames.LLMFullResponseStartFrame, *frames.LLMFullResponseEndFrame,
 		*frames.LLMTextFrame, *frames.TextFrame:
 		emit.Down(f)
@@ -98,13 +122,11 @@ func (l *LLM) Process(ctx context.Context, f frames.Frame, dir processor.Directi
 		}
 		l.mu.Unlock()
 		emit.Down(f)
-	case *frames.LLMRunFrame:
-		if l.H() == nil && l.Reenter == nil {
-			emit.Down(&frames.ErrorFrame{Err: fmt.Errorf("openai: pipeline handle not configured")})
-			return nil
+	case *frames.LLMSetToolsFrame:
+		if l.tools != nil {
+			l.tools.SetSchema(fr.Tools)
 		}
-		services.PipelineLog("llm", "%s: LLMRunFrame → starting chat completion", l.name)
-		go l.runCompletion(l.TurnContext())
+		emit.Down(f)
 	case *frames.ErrorFrame:
 		emit.Down(f)
 	default:
@@ -114,16 +136,26 @@ func (l *LLM) Process(ctx context.Context, f frames.Frame, dir processor.Directi
 }
 
 type chatReq struct {
-	Model    string           `json:"model"`
-	Messages []map[string]any `json:"messages"`
-	Stream   bool             `json:"stream"`
+	Model    string `json:"model"`
+	Messages any    `json:"messages"`
+	Stream   bool   `json:"stream"`
+	Tools    any    `json:"tools,omitempty"`
 }
 
 type streamChunk struct {
 	Choices []struct {
 		Delta struct {
-			Content string `json:"content"`
+			Content   string `json:"content"`
+			ToolCalls []struct {
+				Index    int    `json:"index"`
+				ID       string `json:"id"`
+				Function struct {
+					Name      string `json:"name"`
+					Arguments string `json:"arguments"`
+				} `json:"function"`
+			} `json:"tool_calls"`
 		} `json:"delta"`
+		FinishReason string `json:"finish_reason"`
 	} `json:"choices"`
 }
 
@@ -137,9 +169,27 @@ func (l *LLM) runCompletion(parent context.Context) {
 	l.mu.Unlock()
 	defer cancel()
 
-	msgs := l.Ctx.Snapshot()
-	services.PipelineLog("llm", "%s: POST /v1/chat/completions model=%q messages=%d", l.name, l.Model, len(msgs))
-	body, _ := json.Marshal(chatReq{Model: l.Model, Messages: msgs, Stream: true})
+	wire, err := oa.Chat{}.Messages(l.Ctx.Messages())
+	if err != nil {
+		_ = l.push(ctx, &frames.ErrorFrame{Err: err})
+		return
+	}
+	schema := l.tools.Schema()
+	reqBody := chatReq{Model: l.Model, Messages: wire, Stream: true}
+	if len(schema.Functions) > 0 {
+		toolsWire, err := oa.Chat{}.Tools(schema)
+		if err != nil {
+			_ = l.push(ctx, &frames.ErrorFrame{Err: err})
+			return
+		}
+		reqBody.Tools = toolsWire
+	}
+	services.PipelineLog("llm", "%s: POST /v1/chat/completions model=%q messages=%d tools=%d", l.name, l.Model, len(l.Ctx.Messages()), len(schema.Functions))
+	body, err := json.Marshal(reqBody)
+	if err != nil {
+		_ = l.push(ctx, &frames.ErrorFrame{Err: err})
+		return
+	}
 	base := l.BaseURL
 	if base == "" {
 		base = "https://api.openai.com/v1"
@@ -154,8 +204,7 @@ func (l *LLM) runCompletion(parent context.Context) {
 			chatURL = u.String()
 		}
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
-		chatURL, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, chatURL, bytes.NewReader(body))
 	if err != nil {
 		services.PipelineLog("llm", "%s: request error: %v", l.name, err)
 		_ = l.push(ctx, &frames.ErrorFrame{Err: err})
@@ -179,11 +228,13 @@ func (l *LLM) runCompletion(parent context.Context) {
 	}
 
 	_ = l.push(ctx, &frames.LLMFullResponseStartFrame{})
+	var spoken strings.Builder
+	var acc llmbase.CallAcc
 	sc := bufio.NewScanner(resp.Body)
 	for sc.Scan() {
 		if ctx.Err() != nil {
 			services.PipelineLog("llm", "%s: stream cancelled (%v)", l.name, ctx.Err())
-			_ = l.push(ctx, &frames.LLMFullResponseEndFrame{})
+			_ = l.push(context.Background(), &frames.LLMFullResponseEndFrame{})
 			return
 		}
 		line := sc.Text()
@@ -195,16 +246,43 @@ func (l *LLM) runCompletion(parent context.Context) {
 			break
 		}
 		var ch streamChunk
-		if json.Unmarshal([]byte(data), &ch) != nil {
+		if json.Unmarshal([]byte(data), &ch) != nil || len(ch.Choices) == 0 {
 			continue
 		}
-		if len(ch.Choices) > 0 && ch.Choices[0].Delta.Content != "" {
+		d := ch.Choices[0].Delta
+		if d.Content != "" {
+			spoken.WriteString(d.Content)
 			if os.Getenv("LLMPIPE_LOG_LLM_TOKENS") == "1" {
-				services.PipelineLog("llm", "%s: stream token: %q", l.name, ch.Choices[0].Delta.Content)
+				services.PipelineLog("llm", "%s: stream token: %q", l.name, d.Content)
 			}
-			_ = l.push(ctx, &frames.LLMTextFrame{Text: ch.Choices[0].Delta.Content})
+			_ = l.push(ctx, &frames.LLMTextFrame{Text: d.Content})
+		}
+		for _, tc := range d.ToolCalls {
+			acc.Add(tc.Index, tc.ID, tc.Function.Name, tc.Function.Arguments)
 		}
 	}
-	_ = l.push(ctx, &frames.LLMFullResponseEndFrame{})
-	services.PipelineLog("llm", "%s: stream finished", l.name)
+	calls := acc.Calls()
+	if len(calls) == 0 || ctx.Err() != nil {
+		_ = l.push(context.Background(), &frames.LLMFullResponseEndFrame{})
+		services.PipelineLog("llm", "%s: stream finished", l.name)
+		return
+	}
+	services.PipelineLog("llm", "%s: %d tool call(s)", l.name, len(calls))
+	llmbase.Run(parent, l.ProcContext(), l.tools, l.Ctx, spoken.String(), calls, l.hooks(func() {
+		_ = l.push(context.Background(), &frames.LLMFullResponseEndFrame{})
+	}))
+	services.PipelineLog("llm", "%s: tool calls finished", l.name)
+}
+
+func (l *LLM) hooks(before func()) llmbase.Hooks {
+	return llmbase.Hooks{
+		BeforeHandlers: before,
+		Down:           func(ctx context.Context, f frames.Frame) error { return l.push(ctx, f) },
+		Up: func(ctx context.Context, f frames.Frame) error {
+			if l.H() == nil {
+				return nil
+			}
+			return services.PushUp(ctx, l.H(), l.name, f)
+		},
+	}
 }

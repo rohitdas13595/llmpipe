@@ -7,11 +7,14 @@ import (
 	"testing"
 	"time"
 
+	"encoding/json"
+
 	"github.com/rohitdas13595/llmpipe/audio/interrupt"
 	"github.com/rohitdas13595/llmpipe/frames"
 	"github.com/rohitdas13595/llmpipe/pipeline"
 	"github.com/rohitdas13595/llmpipe/pipeline/pipelinetest"
 	"github.com/rohitdas13595/llmpipe/processor"
+	"github.com/rohitdas13595/llmpipe/processors/tools"
 )
 
 func TestUserAggregatorTranscriptionEmitsLLMRun(t *testing.T) {
@@ -257,6 +260,75 @@ func TestAssistantInterruptCommitsPlayedSentence(t *testing.T) {
 	}
 	msgs := ctxBag.Snapshot()
 	if len(msgs) != 1 || msgs[0]["content"] != "Hello there." {
+		t.Fatalf("context = %#v", msgs)
+	}
+}
+
+func TestAssistantToolResultsFollowUpOnce(t *testing.T) {
+	ctxBag := NewLLMContext("")
+	a := NewAssistantAggregator("asst", ctxBag)
+	var ups []string
+	emit := processor.Emit{
+		Down: func(frames.Frame) {},
+		Up: func(f frames.Frame) {
+			ups = append(ups, f.FrameKind())
+		},
+	}
+	ctx := context.Background()
+	off := false
+	steps := []frames.Frame{
+		&frames.LLMFullResponseStartFrame{},
+		&frames.LLMTextFrame{Text: "Checking"},
+		&frames.FunctionCallsStartedFrame{Content: "Checking", Batch: []tools.Call{
+			{ID: "c1", Name: "get_weather", Args: json.RawMessage(`{"location":"Paris"}`)},
+			{ID: "c2", Name: "get_time", Args: json.RawMessage(`{}`)},
+		}},
+		&frames.LLMFullResponseEndFrame{},
+		&frames.FunctionCallResultFrame{CallID: "c2", Name: "get_time", Result: "noon"},
+		&frames.FunctionCallResultFrame{CallID: "c1", Name: "get_weather", Result: "sun"},
+	}
+	for _, f := range steps {
+		if err := a.Process(ctx, f, processor.Downstream, emit); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(ups) != 1 || ups[0] != frames.KindLLMRun {
+		t.Fatalf("upstream = %v", ups)
+	}
+	msgs := ctxBag.Messages()
+	if len(msgs) != 3 || msgs[0].Content != "Checking" || len(msgs[0].ToolCalls) != 2 {
+		t.Fatalf("assistant = %#v", msgs)
+	}
+	if msgs[0].ToolCalls[0].ID != "c1" || msgs[1].ToolCallID != "c1" || msgs[1].Content != "sun" {
+		t.Fatalf("order = %#v / %#v", msgs[1], msgs[2])
+	}
+	if msgs[2].ToolCallID != "c2" || msgs[2].Content != "noon" {
+		t.Fatalf("second = %#v", msgs[2])
+	}
+	// A result that opts out of a follow-up does not ask for another run.
+	a2 := NewAssistantAggregator("asst", NewLLMContext(""))
+	ups = nil
+	_ = a2.Process(ctx, &frames.FunctionCallsStartedFrame{Batch: []tools.Call{{ID: "c", Name: "n"}}}, processor.Downstream, emit)
+	_ = a2.Process(ctx, &frames.FunctionCallResultFrame{CallID: "c", Result: "x", RunLLM: &off}, processor.Downstream, emit)
+	if len(ups) != 0 {
+		t.Fatalf("skip follow-up, got %v", ups)
+	}
+}
+
+func TestAssistantCancelledToolDoesNotFollowUp(t *testing.T) {
+	ctxBag := NewLLMContext("")
+	a := NewAssistantAggregator("asst", ctxBag)
+	var ups int
+	emit := processor.Emit{Down: func(frames.Frame) {}, Up: func(frames.Frame) { ups++ }}
+	ctx := context.Background()
+	_ = a.Process(ctx, &frames.FunctionCallsStartedFrame{Batch: []tools.Call{{ID: "c", Name: "slow"}}}, processor.Downstream, emit)
+	_ = a.Process(ctx, &frames.InterruptionFrame{}, processor.Downstream, emit)
+	_ = a.Process(ctx, &frames.FunctionCallResultFrame{CallID: "c", Result: "CANCELLED", Cancelled: true}, processor.Downstream, emit)
+	if ups != 0 {
+		t.Fatalf("follow-ups = %d", ups)
+	}
+	msgs := ctxBag.Messages()
+	if len(msgs) != 2 || msgs[1].Content != "CANCELLED" {
 		t.Fatalf("context = %#v", msgs)
 	}
 }

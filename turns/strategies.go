@@ -284,10 +284,11 @@ func (m *FirstSpeechMute) Muted(f frames.Frame, s *TurnState) bool {
 }
 
 // FunctionCallMute drops user audio while function calls are in flight.
-// Each frame whose kind is FunctionCallsStarted increments the count.
-// FunctionCallResult and FunctionCallCancel decrement it. A frame may
-// implement callNamer to count as more than one call; phase 5's batch frame
-// can do that. Until then each started frame is one call.
+// FunctionCallsStarted increments the count by Calls() when the frame
+// reports a batch size, otherwise by one. FunctionCallResult and
+// FunctionCallCancel each decrement it. The service pushes the started
+// frame and a successful result upstream, and a cancel (not the result)
+// upstream, so one call moves the count by one.
 type FunctionCallMute struct {
 	inflight int
 }
