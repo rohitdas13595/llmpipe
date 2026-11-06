@@ -47,12 +47,12 @@ Both `**cmd/voicebot**` and `**cmd/voicebot-livekit**` call `godotenv.Load()` at
 | `LISTEN`                                    | HTTP address (default `:8080`)                                                     |
 | `SAMPLE_RATE`                               | PCM rate (default `16000`)                                                         |
 | `PIPELINE`                                  | `classic` (default), `gemini_live`, `openai_realtime` — realtime modes skip VAD+STT+LLM+TTS (see [`docs/PROVIDERS.md`](docs/PROVIDERS.md)) |
-| `STT`                                       | `deepgram` (default), `google`, `openai`, `groq`, `assemblyai`, `aws`, `sarvam`     |
+| `STT`                                       | `deepgram` streaming (default), `deepgram_batch`, `google`, `openai`, `groq`, `assemblyai`, `aws`, `sarvam` |
 | `LLM`                                       | `openai` (default), `google`, `anthropic`, `groq`                                 |
-| `TTS`                                       | `elevenlabs` (default), `openai`, `google`, `aws`, `sarvam`                         |
+| `TTS`                                       | `elevenlabs` streaming (default), `elevenlabs_rest`, `openai`, `groq`, `google`, `aws`, `sarvam` |
 | `OPENAI_API_KEY`, `OPENAI_MODEL`, `OPENAI_BASE_URL` | Chat completions; base URL optional (OpenAI-compatible providers)          |
-| `DEEPGRAM_API_KEY`                          | Deepgram prerecorded (on utterance end)                                            |
-| `ELEVENLABS_API_KEY`, `ELEVENLABS_VOICE_ID` | ElevenLabs PCM                                                                     |
+| `DEEPGRAM_API_KEY`                          | Deepgram streaming (`deepgram_batch` uses prerecorded HTTP)                        |
+| `ELEVENLABS_API_KEY`, `ELEVENLABS_VOICE_ID` | ElevenLabs Flash websocket (`elevenlabs_rest` uses HTTP PCM)                       |
 | `GEMINI_MODEL`, `GEMINI_API_KEY` / `GOOGLE_API_KEY` | Gemini LLM; for `STT=google` also short audio transcription (`GEMINI_STT_MODEL`) |
 | `GROQ_API_KEY`, `GROQ_MODEL`                | Groq LLM; `STT=groq` uses Whisper on Groq                                           |
 | `ANTHROPIC_API_KEY`, `ANTHROPIC_MODEL`      | Claude when `LLM=anthropic`                                                         |

@@ -6,148 +6,68 @@ import (
 	"io"
 	"net/http"
 	"strings"
-	"sync"
 
 	"github.com/rohitdas13595/llmpipe/aggregate"
-	"github.com/rohitdas13595/llmpipe/frames"
-	"github.com/rohitdas13595/llmpipe/processor"
-	"github.com/rohitdas13595/llmpipe/services"
+	"github.com/rohitdas13595/llmpipe/services/ttsbase"
 )
 
-// TTS calls ElevenLabs REST API with PCM output.
-// It buffers streamed LLM text and synthesizes once per response so the API
-// receives full sentences instead of one HTTP call per token (which often fails or is inaudible).
-type TTS struct {
-	name       string
-	APIKey     string
-	VoiceID    string
-	ModelID    string
-	SampleRate int
-	Bot        *aggregate.BotState
-
-	services.Slot
-	mu         sync.Mutex
-	canceling  bool
-	textBuffer strings.Builder
-}
-
-func NewTTS(name, apiKey, voiceID string, bot *aggregate.BotState, sampleRate int) *TTS {
+// NewTTS is the ElevenLabs REST synthesizer wrapped by ttsbase.
+// Sentences are spoken as they complete instead of waiting for the full reply.
+// bot is accepted for compatibility; playback state comes from the output.
+func NewTTS(name, apiKey, voiceID string, bot *aggregate.BotState, sampleRate int) *ttsbase.TTS {
+	_ = bot
 	if sampleRate <= 0 {
 		sampleRate = 16000
 	}
-	return &TTS{
-		name:       name,
-		APIKey:     apiKey,
-		VoiceID:    voiceID,
-		ModelID:    "eleven_turbo_v2_5",
-		SampleRate: sampleRate,
-		Bot:        bot,
-	}
+	return ttsbase.New(&restSynth{
+		apiKey:     apiKey,
+		voiceID:    voiceID,
+		modelID:    "eleven_turbo_v2_5",
+		sampleRate: sampleRate,
+	}, ttsbase.Options{Name: name, SampleRate: sampleRate, PushTextFrames: true})
 }
 
-func (t *TTS) Name() string { return t.name }
-
-func (t *TTS) Process(ctx context.Context, f frames.Frame, dir processor.Direction, emit processor.Emit) error {
-	if dir == processor.Upstream {
-		processor.Forward(dir, f, emit)
-		return nil
-	}
-	switch fr := f.(type) {
-	case *frames.LLMFullResponseStartFrame:
-		t.mu.Lock()
-		t.canceling = false
-		t.textBuffer.Reset()
-		t.mu.Unlock()
-		emit.Down(f)
-	case *frames.LLMFullResponseEndFrame:
-		t.mu.Lock()
-		text := strings.TrimSpace(t.textBuffer.String())
-		t.textBuffer.Reset()
-		canceling := t.canceling
-		t.mu.Unlock()
-		synth := func(ctx context.Context, emit processor.Emit) {
-			t.speak(ctx, emit, text, canceling)
-			emit.Down(f)
-		}
-		if h := t.H(); h != nil {
-			turn := h.TurnContext()
-			go synth(turn, processor.Emit{Down: func(ff frames.Frame) {
-				_ = h.PushFrameCtx(turn, ff, processor.Downstream)
-			}})
-			return nil
-		}
-		synth(ctx, emit)
-		return nil
-	case *frames.InterruptionFrame:
-		t.mu.Lock()
-		t.canceling = true
-		t.textBuffer.Reset()
-		t.mu.Unlock()
-		emit.Down(f)
-	case *frames.LLMTextFrame:
-		t.mu.Lock()
-		t.textBuffer.WriteString(fr.Text)
-		t.mu.Unlock()
-		emit.Down(f)
-	case *frames.TextFrame:
-		t.mu.Lock()
-		t.textBuffer.WriteString(fr.Text)
-		t.mu.Unlock()
-		emit.Down(f)
-	default:
-		emit.Down(f)
-	}
-	return nil
+type restSynth struct {
+	apiKey     string
+	voiceID    string
+	modelID    string
+	sampleRate int
 }
 
-func (t *TTS) speak(ctx context.Context, emit processor.Emit, text string, canceling bool) {
-	if canceling || text == "" {
-		return
+func (s *restSynth) Synthesize(ctx context.Context, text string, out func(ttsbase.AudioChunk) error) error {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return nil
 	}
-	if t.APIKey == "" {
-		services.PipelineLog("tts", "elevenlabs: ELEVENLABS_API_KEY is empty")
-		emit.Down(&frames.ErrorFrame{Err: fmt.Errorf("elevenlabs: missing API key")})
-		return
+	if s.apiKey == "" {
+		return fmt.Errorf("elevenlabs: missing API key")
 	}
-	if strings.TrimSpace(t.VoiceID) == "" {
-		services.PipelineLog("tts", "elevenlabs: ELEVENLABS_VOICE_ID is empty")
-		emit.Down(&frames.ErrorFrame{Err: fmt.Errorf("elevenlabs: missing voice id")})
-		return
+	if strings.TrimSpace(s.voiceID) == "" {
+		return fmt.Errorf("elevenlabs: missing voice id")
 	}
-	preview := text
-	if len(preview) > 120 {
-		preview = preview[:120] + "…"
-	}
-	services.PipelineLog("tts", "elevenlabs: synthesizing %d chars, preview: %q", len(text), preview)
-	pcm, err := t.synth(ctx, text)
+	pcm, err := s.synth(ctx, text)
 	if err != nil {
-		services.PipelineLog("tts", "elevenlabs: %v", err)
-		emit.Down(&frames.ErrorFrame{Err: err})
-		return
+		return err
 	}
 	if len(pcm) == 0 {
-		services.PipelineLog("tts", "elevenlabs: empty PCM response")
-		return
+		return nil
 	}
-	services.PipelineLog("tts", "elevenlabs: synthesized %d bytes PCM (%d Hz) for %d chars", len(pcm), t.SampleRate, len(text))
-	services.EmitTTS(emit, text, pcm, t.SampleRate)
+	return out(ttsbase.AudioChunk{PCM: pcm, SampleRate: s.sampleRate})
 }
 
-func (t *TTS) synth(ctx context.Context, text string) ([]byte, error) {
-	format := pcmOutputFormat(t.SampleRate)
+func (s *restSynth) synth(ctx context.Context, text string) ([]byte, error) {
 	u := fmt.Sprintf(
 		"https://api.elevenlabs.io/v1/text-to-speech/%s?output_format=%s",
-		t.VoiceID,
-		format,
+		s.voiceID,
+		pcmOutputFormat(s.sampleRate),
 	)
-	payload := fmt.Sprintf(`{"text":%q,"model_id":%q}`, text, t.ModelID)
+	payload := fmt.Sprintf(`{"text":%q,"model_id":%q}`, text, s.modelID)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u, strings.NewReader(payload))
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("xi-api-key", t.APIKey)
+	req.Header.Set("xi-api-key", s.apiKey)
 	req.Header.Set("Content-Type", "application/json")
-
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return nil, err

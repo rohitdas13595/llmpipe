@@ -78,8 +78,11 @@ func BuildSTT(backend string, re services.ReenterFunc, sampleRate int, bot *aggr
 		}, re, sampleRate, bot)
 	case "assemblyai", "aai":
 		return assemblyai.NewSTT("stt", os.Getenv("ASSEMBLYAI_API_KEY"), re, sampleRate, bot)
-	default:
+	case "deepgram_batch", "deepgram_prerecorded", "deepgram_http":
 		return deepgram.NewSTT("stt", os.Getenv("DEEPGRAM_API_KEY"), re, sampleRate, bot)
+	default:
+		// Streaming is the default. STT=deepgram_batch keeps the prerecorded HTTP client.
+		return deepgram.NewLive("stt", os.Getenv("DEEPGRAM_API_KEY"), re, sampleRate, bot)
 	}
 }
 
@@ -149,8 +152,11 @@ func BuildTTS(backend string, bot *aggregate.BotState, sampleRate int) processor
 			EnvOr("GROQ_TTS_MODEL", "canopylabs/orpheus-v1-english"),
 			EnvOr("GROQ_TTS_VOICE", "autumn"),
 			bot, sampleRate)
-	default:
+	case "elevenlabs_rest", "elevenlabs_http":
 		return elevenlabs.NewTTS("tts", os.Getenv("ELEVENLABS_API_KEY"), os.Getenv("ELEVENLABS_VOICE_ID"), bot, sampleRate)
+	default:
+		// Streaming multi-context websocket. TTS=elevenlabs_rest keeps HTTP.
+		return elevenlabs.NewStreamingTTS("tts", os.Getenv("ELEVENLABS_API_KEY"), os.Getenv("ELEVENLABS_VOICE_ID"), bot, sampleRate)
 	}
 }
 
