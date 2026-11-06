@@ -1,5 +1,6 @@
 // Command voicebot is a WebSocket PCM demo: input → VAD → STT → LLM → TTS → output,
 // or PIPELINE=gemini_live / openai_realtime (see ../pipecat Parity in docs/PROVIDERS.md).
+// Each WebSocket connection gets its own pipeline task.
 package main
 
 import (
@@ -10,6 +11,7 @@ import (
 	"os/signal"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -41,6 +43,61 @@ func main() {
 		}
 	}
 
+	rootCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	var sessions sessionSet
+	mux := http.NewServeMux()
+	mux.Handle("/demo/", http.StripPrefix("/demo/", http.FileServer(http.FS(ex.FS))))
+	mux.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
+		runVoiceSession(rootCtx, &sessions, w, r, sampleRate)
+	})
+
+	addr := providers.EnvOr("LISTEN", ":8080")
+	srv := &http.Server{Addr: addr, Handler: mux}
+	go func() {
+		show := addr
+		if strings.HasPrefix(show, ":") {
+			show = "127.0.0.1" + show
+		} else if strings.HasPrefix(show, "0.0.0.0:") {
+			show = "127.0.0.1:" + strings.TrimPrefix(show, "0.0.0.0:")
+		}
+		log.Printf("voicebot: http://%s/demo/voicebot-client.html · ws://%s/ws (%d Hz s16le mono) PIPELINE=%s",
+			show, show, sampleRate, providers.PipelineMode())
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatal(err)
+		}
+	}()
+
+	<-rootCtx.Done()
+	sessions.cancelAll()
+	shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := srv.Shutdown(shutCtx); err != nil {
+		log.Println("http shutdown:", err)
+	}
+}
+
+type sessionSet struct {
+	mu    sync.Mutex
+	tasks []*pipeline.PipelineTask
+}
+
+func (s *sessionSet) add(t *pipeline.PipelineTask) {
+	s.mu.Lock()
+	s.tasks = append(s.tasks, t)
+	s.mu.Unlock()
+}
+
+func (s *sessionSet) cancelAll() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, t := range s.tasks {
+		t.Cancel()
+	}
+}
+
+func runVoiceSession(root context.Context, sessions *sessionSet, w http.ResponseWriter, r *http.Request, sampleRate int) {
 	llmBackend := strings.ToLower(providers.EnvOr("LLM", "openai"))
 	if llmBackend == "gemini" {
 		llmBackend = "google"
@@ -54,15 +111,104 @@ func main() {
 	strategy := interrupt.MinWords{N: 1}
 
 	var task *pipeline.PipelineTask
-	reenter := func(ctx context.Context, name string, f frames.Frame) error {
+	tr := ws.NewTransport(sampleRate, func(ctx context.Context, ff []frames.Frame) error {
 		if task == nil {
 			return nil
 		}
-		return task.ReenterAfter(ctx, name, f)
+		return task.QueueFrames(ctx, ff)
+	})
+
+	userIdle := idle.NewUserProcessor("user.idle", time.Minute, func(retry int) bool {
+		log.Printf("user idle 1m: end pipeline task only (HTTP server keeps running) retry=%d", retry)
+		if task != nil {
+			task.StopWhenDone()
+		}
+		return false
+	})
+
+	var procs []processor.Processor
+	switch pipeMode {
+	case "gemini_live", "google_live":
+		log.Printf("PIPELINE=%s (Gemini Live — Pipecat google/gemini_live)", pipeMode)
+		procs = []processor.Processor{
+			userIdle,
+			tr.Input(),
+			providers.BuildGeminiLive(nil, bot, providers.EnvOr("SYSTEM_PROMPT", "")),
+			tr.Output(),
+		}
+	case "openai_realtime":
+		log.Printf("PIPELINE=openai_realtime (Pipecat openai/realtime)")
+		procs = []processor.Processor{
+			userIdle,
+			tr.Input(),
+			providers.BuildOpenAIRealtime(nil, bot, providers.EnvOr("SYSTEM_PROMPT", "")),
+			tr.Output(),
+		}
+	default:
+		stt := providers.BuildSTT(sttBackend, nil, sampleRate, bot)
+		llm := providers.BuildLLM(llmBackend, nil, ctxLLM)
+		tts := providers.BuildTTS(ttsBackend, bot, sampleRate)
+		procs = []processor.Processor{
+			userIdle,
+			tr.Input(),
+			vadProcessor(sampleRate),
+		}
+		if providers.EnvOr("TURN_TRACK", "1") != "0" {
+			procs = append(procs, turn.NewTrackingProcessor("turn"))
+		}
+		procs = append(procs,
+			stt,
+			aggregate.NewUserAggregator("user.agg", ctxLLM, bot, strategy),
+			llm,
+			aggregate.NewAssistantAggregator("assistant", ctxLLM),
+			tts,
+			tr.Output(),
+		)
 	}
 
-	userAgg := aggregate.NewUserAggregator("user.agg", ctxLLM, bot, strategy)
-	asst := aggregate.NewAssistantAggregator("assistant", ctxLLM)
+	idleObs := observe.NewIdleFrameObserver(observe.IdleConfig{
+		Timeout: 30 * time.Minute,
+		OnIdle: func() {
+			log.Println("pipeline idle timeout")
+			if task != nil {
+				task.StopWhenDone()
+			}
+		},
+	})
+	task = pipeline.NewPipelineTask(pipeline.NewPipeline(procs...), pipeline.WithIdleObserver(idleObs))
+	sessions.add(task)
+	tr.OnDisconnect = func() {
+		log.Println("websocket closed: cancel pipeline task")
+		task.Cancel()
+	}
+
+	ctx, cancel := context.WithCancel(root)
+	defer cancel()
+	go func() {
+		select {
+		case <-r.Context().Done():
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+	errCh := make(chan error, 1)
+	go func() { errCh <- task.Run(ctx) }()
+	if err := tr.HandleWebSocket(w, r); err != nil {
+		log.Println("websocket:", err)
+	}
+	task.Cancel()
+	select {
+	case err := <-errCh:
+		if err != nil && err != context.Canceled {
+			log.Println("pipeline:", err)
+		}
+	case <-time.After(25 * time.Second):
+		log.Println("pipeline cancel timed out")
+	}
+}
+
+func vadProcessor(sampleRate int) processor.Processor {
+	_ = sampleRate
 	vadTh := 120.0
 	if v := os.Getenv("VAD_RMS_THRESHOLD"); v != "" {
 		if f, err := strconv.ParseFloat(v, 64); err == nil && f > 0 {
@@ -76,116 +222,7 @@ func main() {
 			log.Printf("VAD: TURN_SILENCE_MS=%.0f (time-based end-of-user-turn)", ms)
 		}
 	}
-	vadP := vad.NewProcessor("vad", vadAna)
-
-	userIdle := idle.NewUserProcessor("user.idle", time.Minute, func(retry int) bool {
-		log.Printf("user idle 1m: end pipeline task only (HTTP server keeps running) retry=%d", retry)
-		if task != nil {
-			_ = task.QueueFrames(context.Background(), []frames.Frame{&frames.EndFrame{}})
-			task.Cancel()
-		}
-		return false
-	})
-
-	tr := ws.NewTransport(sampleRate, func(ctx context.Context, ff []frames.Frame) error {
-		if task == nil {
-			return nil
-		}
-		return task.QueueFrames(ctx, ff)
-	})
-
-	var procs []processor.Processor
-	switch pipeMode {
-	case "gemini_live", "google_live":
-		log.Printf("PIPELINE=%s (Gemini Live — Pipecat google/gemini_live)", pipeMode)
-		procs = []processor.Processor{
-			userIdle,
-			tr.Input(),
-			providers.BuildGeminiLive(reenter, bot, providers.EnvOr("SYSTEM_PROMPT", "")),
-			tr.Output(),
-		}
-	case "openai_realtime":
-		log.Printf("PIPELINE=openai_realtime (Pipecat openai/realtime)")
-		procs = []processor.Processor{
-			userIdle,
-			tr.Input(),
-			providers.BuildOpenAIRealtime(reenter, bot, providers.EnvOr("SYSTEM_PROMPT", "")),
-			tr.Output(),
-		}
-	default:
-		stt := providers.BuildSTT(sttBackend, reenter, sampleRate, bot)
-		llm := providers.BuildLLM(llmBackend, reenter, ctxLLM)
-		tts := providers.BuildTTS(ttsBackend, bot, sampleRate)
-		procs = []processor.Processor{
-			userIdle,
-			tr.Input(),
-			vadP,
-		}
-		if providers.EnvOr("TURN_TRACK", "1") != "0" {
-			procs = append(procs, turn.NewTrackingProcessor("turn"))
-		}
-		procs = append(procs,
-			stt,
-			userAgg,
-			llm,
-			asst,
-			tts,
-			tr.Output(),
-		)
-	}
-
-	p := pipeline.NewPipeline(procs...)
-
-	idleObs := observe.NewIdleFrameObserver(observe.IdleConfig{
-		Timeout: 30 * time.Minute,
-		OnIdle: func() {
-			log.Println("pipeline idle timeout")
-			if task != nil {
-				task.Cancel()
-			}
-		},
-	})
-
-	task = pipeline.NewPipelineTask(p, pipeline.WithIdleObserver(idleObs))
-
-	tr.OnDisconnect = func() {
-		log.Println("websocket closed: queue EndFrame and stop pipeline")
-		if task != nil {
-			_ = task.QueueFrames(context.Background(), []frames.Frame{&frames.EndFrame{}})
-			task.Cancel()
-		}
-	}
-
-	addr := providers.EnvOr("LISTEN", ":8080")
-	http.Handle("/demo/", http.StripPrefix("/demo/", http.FileServer(http.FS(ex.FS))))
-	http.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
-		if err := tr.HandleWebSocket(w, r); err != nil {
-			log.Println("websocket:", err)
-		}
-	})
-	go func() {
-		show := addr
-		if strings.HasPrefix(show, ":") {
-			show = "127.0.0.1" + show
-		} else if strings.HasPrefix(show, "0.0.0.0:") {
-			show = "127.0.0.1:" + strings.TrimPrefix(show, "0.0.0.0:")
-		}
-		log.Printf("voicebot: http://%s/demo/voicebot-client.html · ws://%s/ws (%d Hz s16le mono) PIPELINE=%s",
-			show, show, sampleRate, pipeMode)
-		if err := http.ListenAndServe(addr, nil); err != nil {
-			log.Fatal(err)
-		}
-	}()
-
-	rootCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
-
-	runner := pipeline.NewRunner(false)
-	if err := runner.Run(rootCtx, task); err != nil && err != context.Canceled {
-		log.Println("runner:", err)
-	}
-	log.Println("pipeline task stopped; HTTP server still listening until SIGINT/SIGTERM")
-	<-rootCtx.Done()
+	return vad.NewProcessor("vad", vadAna)
 }
 
 func envIntOr(k string, def int) int {

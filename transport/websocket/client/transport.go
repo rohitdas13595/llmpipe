@@ -52,7 +52,10 @@ func (t *Transport) Connect(ctx context.Context) error {
 	if d == nil {
 		d = websocket.DefaultDialer
 	}
-	c, _, err := d.DialContext(ctx, t.URL, t.Header)
+	c, resp, err := d.DialContext(ctx, t.URL, t.Header)
+	if resp != nil && resp.Body != nil {
+		_ = resp.Body.Close()
+	}
 	if err != nil {
 		return err
 	}

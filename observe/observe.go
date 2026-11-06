@@ -13,10 +13,10 @@ type FrameObserver interface {
 
 // FramePushed is observer event data.
 type FramePushed struct {
-	Frame      frames.Frame
-	Direction  processor.Direction
-	Processor  string
-	Index      int
+	Frame     frames.Frame
+	Direction processor.Direction
+	Processor string
+	Index     int
 }
 
 // FuncObserver adapts a function to FrameObserver.

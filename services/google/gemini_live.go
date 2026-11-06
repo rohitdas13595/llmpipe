@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"google.golang.org/genai"
 
@@ -24,12 +25,14 @@ type GeminiLive struct {
 	Reenter      services.ReenterFunc
 	Bot          *aggregate.BotState
 
-	mu          sync.Mutex
-	session     *genai.Session
-	recvCancel  context.CancelFunc
-	sampleRate  int
-	connecting  bool
-	connectErr  error
+	services.Slot
+	started    atomic.Bool
+	mu         sync.Mutex
+	session    *genai.Session
+	recvCancel context.CancelFunc
+	sampleRate int
+	connecting bool
+	connectErr error
 }
 
 func NewGeminiLive(name string, client *genai.Client, model, system string, re services.ReenterFunc, bot *aggregate.BotState) *GeminiLive {
@@ -43,6 +46,35 @@ func NewGeminiLive(name string, client *genai.Client, model, system string, re s
 
 func (g *GeminiLive) Name() string { return g.name }
 
+func (g *GeminiLive) push(ctx context.Context, f frames.Frame) error {
+	return services.PushDown(ctx, g.H(), g.Reenter, g.name, f)
+}
+
+// Setup stores the handle and starts the live session on the processor context.
+func (g *GeminiLive) Setup(ctx context.Context, h processor.Handle) error {
+	if err := g.Slot.Setup(ctx, h); err != nil {
+		return err
+	}
+	g.ensure(h.Context())
+	return nil
+}
+
+// Cleanup closes the live session.
+func (g *GeminiLive) Cleanup(ctx context.Context) error {
+	g.shutdown()
+	return nil
+}
+
+func (g *GeminiLive) ensure(ctx context.Context) {
+	if g.Client == nil || (g.H() == nil && g.Reenter == nil) {
+		return
+	}
+	if !g.started.CompareAndSwap(false, true) {
+		return
+	}
+	go g.connect(ctx)
+}
+
 func (g *GeminiLive) Process(ctx context.Context, f frames.Frame, dir processor.Direction, emit processor.Emit) error {
 	switch fr := f.(type) {
 	case *frames.StartFrame:
@@ -51,7 +83,11 @@ func (g *GeminiLive) Process(ctx context.Context, f frames.Frame, dir processor.
 			g.sampleRate = 16000
 		}
 		emit.Down(f)
-		go g.connect(context.Background())
+		parent := context.Background()
+		if h := g.H(); h != nil {
+			parent = h.Context()
+		}
+		g.ensure(parent)
 	case *frames.InputAudioRawFrame:
 		emit.Down(f)
 		g.mu.Lock()
@@ -85,7 +121,7 @@ func (g *GeminiLive) connect(bg context.Context) {
 	g.connecting = true
 	g.mu.Unlock()
 
-	if g.Client == nil || g.Reenter == nil {
+	if g.Client == nil || (g.H() == nil && g.Reenter == nil) {
 		return
 	}
 	cfg := &genai.LiveConnectConfig{
@@ -108,8 +144,9 @@ func (g *GeminiLive) connect(bg context.Context) {
 	}
 	g.mu.Unlock()
 	if err != nil {
+		g.started.Store(false)
 		services.PipelineLog("realtime", "gemini live connect: %v", err)
-		_ = g.Reenter(bg, g.name, &frames.ErrorFrame{Err: err})
+		_ = g.push(bg, &frames.ErrorFrame{Err: err})
 		return
 	}
 	services.PipelineLog("realtime", "gemini live: connected model=%q", g.Model)
@@ -130,8 +167,8 @@ func (g *GeminiLive) receiveLoop(ctx context.Context, sess *genai.Session) {
 		if msg == nil {
 			continue
 		}
-		if msg.ServerContent != nil && msg.ServerContent.Interrupted && g.Reenter != nil {
-			_ = g.Reenter(ctx, g.name, &frames.InterruptionFrame{})
+		if msg.ServerContent != nil && msg.ServerContent.Interrupted {
+			_ = g.push(ctx, &frames.InterruptionFrame{})
 		}
 		if msg.ServerContent != nil && msg.ServerContent.ModelTurn != nil {
 			for _, p := range msg.ServerContent.ModelTurn.Parts {
@@ -152,11 +189,9 @@ func (g *GeminiLive) receiveLoop(ctx context.Context, sess *genai.Session) {
 				if g.Bot != nil {
 					g.Bot.SetSpeaking(true)
 				}
-				if g.Reenter != nil {
-					_ = g.Reenter(ctx, g.name, &frames.BotSpeakingFrame{})
-					_ = g.Reenter(ctx, g.name, &frames.TTSAudioRawFrame{Audio: d, SampleRate: rate, NumChannels: 1})
-					_ = g.Reenter(ctx, g.name, &frames.BotStoppedSpeakingFrame{})
-				}
+				_ = g.push(ctx, &frames.BotSpeakingFrame{})
+				_ = g.push(ctx, &frames.TTSAudioRawFrame{Audio: d, SampleRate: rate, NumChannels: 1})
+				_ = g.push(ctx, &frames.BotStoppedSpeakingFrame{})
 				if g.Bot != nil {
 					g.Bot.SetSpeaking(false)
 				}

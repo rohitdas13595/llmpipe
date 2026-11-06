@@ -30,6 +30,7 @@ type STT struct {
 	// Bot, when set, is used to ignore mic audio while TTS is playing (reduces echo → empty transcripts).
 	Bot *aggregate.BotState
 
+	services.Slot
 	mu  sync.Mutex
 	buf bytes.Buffer
 }
@@ -49,6 +50,10 @@ func NewSTT(name, apiKey string, reenter services.ReenterFunc, sampleRate int, b
 }
 
 func (s *STT) Name() string { return s.name }
+
+func (s *STT) push(ctx context.Context, f frames.Frame) error {
+	return services.PushDown(ctx, s.H(), s.Reenter, s.name, f)
+}
 
 func (s *STT) Process(ctx context.Context, f frames.Frame, dir processor.Direction, emit processor.Emit) error {
 	switch fr := f.(type) {
@@ -72,7 +77,7 @@ func (s *STT) Process(ctx context.Context, f frames.Frame, dir processor.Directi
 			s.mu.Unlock()
 			return nil
 		}
-		go s.flush(context.Background())
+		go s.flush(s.ProcContext())
 	case *frames.InterimTranscriptionFrame:
 		emit.Down(f)
 	default:
@@ -96,12 +101,12 @@ func (s *STT) flush(ctx context.Context) {
 	audio := append([]byte(nil), s.buf.Bytes()...)
 	s.buf.Reset()
 	s.mu.Unlock()
-	if s.Reenter == nil {
+	if s.H() == nil && s.Reenter == nil {
 		return
 	}
 	if s.APIKey == "" {
 		services.PipelineLog("stt", "deepgram: DEEPGRAM_API_KEY is empty; set it in .env")
-		_ = s.Reenter(ctx, s.name, &frames.ErrorFrame{Err: fmt.Errorf("deepgram: missing API key")})
+		_ = s.push(ctx, &frames.ErrorFrame{Err: fmt.Errorf("deepgram: missing API key")})
 		return
 	}
 	if len(audio) == 0 {
@@ -121,7 +126,7 @@ func (s *STT) flush(ctx context.Context) {
 	u := "https://api.deepgram.com/v1/listen?" + q.Encode()
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u, bytes.NewReader(audio))
 	if err != nil {
-		_ = s.Reenter(ctx, s.name, &frames.ErrorFrame{Err: err})
+		_ = s.push(ctx, &frames.ErrorFrame{Err: err})
 		return
 	}
 	req.Header.Set("Authorization", "Token "+s.APIKey)
@@ -130,21 +135,21 @@ func (s *STT) flush(ctx context.Context) {
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		services.PipelineLog("stt", "deepgram: %v", err)
-		_ = s.Reenter(ctx, s.name, &frames.ErrorFrame{Err: err})
+		_ = s.push(ctx, &frames.ErrorFrame{Err: err})
 		return
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	body, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusOK {
 		err := fmt.Errorf("deepgram: %s: %s", resp.Status, string(body))
 		services.PipelineLog("stt", "deepgram: %v", err)
-		_ = s.Reenter(ctx, s.name, &frames.ErrorFrame{Err: err})
+		_ = s.push(ctx, &frames.ErrorFrame{Err: err})
 		return
 	}
 	var out dgResp
 	if json.Unmarshal(body, &out) != nil {
 		services.PipelineLog("stt", "deepgram: invalid json (first 200 chars): %.200q", string(body))
-		_ = s.Reenter(ctx, s.name, &frames.ErrorFrame{Err: fmt.Errorf("deepgram: invalid json")})
+		_ = s.push(ctx, &frames.ErrorFrame{Err: fmt.Errorf("deepgram: invalid json")})
 		return
 	}
 	text := ""
@@ -158,7 +163,7 @@ func (s *STT) flush(ctx context.Context) {
 		return
 	}
 	services.PipelineLog("stt", "deepgram transcript: %q", text)
-	_ = s.Reenter(ctx, s.name, &frames.TranscriptionFrame{Text: text})
+	_ = s.push(ctx, &frames.TranscriptionFrame{Text: text})
 }
 
 // pcmRMS16LE is RMS amplitude for s16le mono (same scale as energy VAD, 0..~32768).

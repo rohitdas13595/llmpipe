@@ -22,11 +22,11 @@ type EnergyAnalyzer struct {
 	MinSilence int     // consecutive silence frames to stop (used when SilenceStopMS == 0)
 	// SilenceStopMS, if > 0, ends a turn after this many milliseconds of continuous
 	// sub-threshold audio after speech (Pipecat smart-turn stop_secs style). MinSilence is ignored for stop.
-	SilenceStopMS float64
-	speechRun     int
-	silenceRun    int
+	SilenceStopMS  float64
+	speechRun      int
+	silenceRun     int
 	silenceMsAccum float64
-	inSpeech      bool
+	inSpeech       bool
 }
 
 func NewEnergyAnalyzer(threshold float64, minSpeech, minSilence int) *EnergyAnalyzer {

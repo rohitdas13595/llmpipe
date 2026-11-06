@@ -8,16 +8,25 @@ import (
 
 	"github.com/rohitdas13595/llmpipe/frames"
 	"github.com/rohitdas13595/llmpipe/processor"
+	"github.com/rohitdas13595/llmpipe/services"
 )
 
 // UserCallback is invoked when the user has been silent for Timeout after conversation activity.
 type UserCallback func(retryCount int) (continueMonitoring bool)
 
+// fireFrame hops the idle callback onto the processor goroutine via QueueSelf.
+type fireFrame struct {
+	frames.Meta
+}
+
+func (fireFrame) FrameKind() string { return "UserIdleFire" }
+
 // UserProcessor resets a timer on user/bot activity and runs Callback on timeout.
 type UserProcessor struct {
-	name       string
-	Timeout    time.Duration
-	Callback   UserCallback
+	name     string
+	Timeout  time.Duration
+	Callback UserCallback
+	services.Slot
 	mu         sync.Mutex
 	timer      *time.Timer
 	retryCount int
@@ -45,24 +54,40 @@ func (u *UserProcessor) armTimer() {
 		}
 	}
 	u.timer = time.AfterFunc(u.Timeout, func() {
-		u.mu.Lock()
-		rc := u.retryCount
-		u.mu.Unlock()
-		cont := u.Callback(rc)
-		u.mu.Lock()
-		if cont {
-			u.retryCount++
-		} else {
-			u.retryCount = 0
+		if h := u.H(); h != nil {
+			_ = h.QueueSelf(&fireFrame{})
+			return
 		}
-		u.mu.Unlock()
-		if cont {
-			u.armTimer()
-		}
+		u.fire()
 	})
 }
 
+func (u *UserProcessor) fire() {
+	u.mu.Lock()
+	rc := u.retryCount
+	cb := u.Callback
+	u.mu.Unlock()
+	if cb == nil {
+		return
+	}
+	cont := cb(rc)
+	u.mu.Lock()
+	if cont {
+		u.retryCount++
+	} else {
+		u.retryCount = 0
+	}
+	u.mu.Unlock()
+	if cont {
+		u.armTimer()
+	}
+}
+
 func (u *UserProcessor) Process(ctx context.Context, f frames.Frame, dir processor.Direction, emit processor.Emit) error {
+	if _, ok := f.(*fireFrame); ok {
+		u.fire()
+		return nil
+	}
 	switch f.(type) {
 	case *frames.StartFrame:
 		u.started = true

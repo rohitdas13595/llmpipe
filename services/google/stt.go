@@ -7,9 +7,9 @@ import (
 
 	"google.golang.org/genai"
 
-	"github.com/rohitdas13595/llmpipe/internal/audiofmt"
 	"github.com/rohitdas13595/llmpipe/aggregate"
 	"github.com/rohitdas13595/llmpipe/frames"
+	"github.com/rohitdas13595/llmpipe/internal/audiofmt"
 	"github.com/rohitdas13595/llmpipe/processor"
 	"github.com/rohitdas13595/llmpipe/services"
 )
@@ -24,6 +24,7 @@ type STT struct {
 	Reenter    services.ReenterFunc
 	Bot        *aggregate.BotState
 
+	services.Slot
 	mu  sync.Mutex
 	buf []byte
 }
@@ -39,6 +40,10 @@ func NewSTT(name string, client *genai.Client, model string, reenter services.Re
 }
 
 func (s *STT) Name() string { return s.name }
+
+func (s *STT) push(ctx context.Context, f frames.Frame) error {
+	return services.PushDown(ctx, s.H(), s.Reenter, s.name, f)
+}
 
 func (s *STT) Process(ctx context.Context, f frames.Frame, dir processor.Direction, emit processor.Emit) error {
 	switch fr := f.(type) {
@@ -62,7 +67,7 @@ func (s *STT) Process(ctx context.Context, f frames.Frame, dir processor.Directi
 			s.mu.Unlock()
 			return nil
 		}
-		go s.transcribe(context.Background())
+		go s.transcribe(s.ProcContext())
 	case *frames.InterimTranscriptionFrame:
 		emit.Down(f)
 	default:
@@ -76,7 +81,7 @@ func (s *STT) transcribe(ctx context.Context) {
 	pcm := append([]byte(nil), s.buf...)
 	s.buf = nil
 	s.mu.Unlock()
-	if s.Reenter == nil || s.Client == nil || len(pcm) == 0 {
+	if (s.H() == nil && s.Reenter == nil) || s.Client == nil || len(pcm) == 0 {
 		return
 	}
 	wav := audiofmt.MonoS16LE(pcm, s.SampleRate)
@@ -89,7 +94,7 @@ func (s *STT) transcribe(ctx context.Context) {
 	cfg := &genai.GenerateContentConfig{Temperature: genai.Ptr(float32(0))}
 	res, err := s.Client.Models.GenerateContent(ctx, s.Model, contents, cfg)
 	if err != nil {
-		_ = s.Reenter(ctx, s.name, &frames.ErrorFrame{Err: err})
+		_ = s.push(ctx, &frames.ErrorFrame{Err: err})
 		return
 	}
 	text := strings.TrimSpace(res.Text())
@@ -97,5 +102,5 @@ func (s *STT) transcribe(ctx context.Context) {
 		return
 	}
 	services.PipelineLog("stt", "google (Gemini audio): %q", text)
-	_ = s.Reenter(ctx, s.name, &frames.TranscriptionFrame{Text: text})
+	_ = s.push(ctx, &frames.TranscriptionFrame{Text: text})
 }

@@ -9,13 +9,12 @@ import (
 	"github.com/rohitdas13595/llmpipe/processor"
 )
 
-// ParallelPipeline runs multiple linear processor branches concurrently. Each
-// incoming downstream frame is delivered to every branch; outputs are merged
-// with pointer-identity deduplication (same as two Identity filters passing one
-// TextFrame). StartFrame, EndFrame, and CancelFrame are synchronized: all
-// branches finish processing the lifecycle frame before it is emitted once
-// downstream, and frames emitted by processors during that window are ordered
-// like Pipecat (StartFrame then buffered; buffered then End/Cancel).
+// ParallelPipeline runs multiple linear processor branches concurrently.
+// PipelineTask does not call Process: it expands the branches into a fan-out
+// node and a join node so every processor has its own goroutine. The join
+// dedupes a fan-out wave by frame Meta.ID and orders Start before side frames
+// and End/Cancel after them. Process remains for callers that invoke the
+// processor outside a task; that path is synchronous per frame.
 type ParallelPipeline struct {
 	name     string
 	branches [][]processor.Processor
@@ -65,15 +64,6 @@ func (pp *ParallelPipeline) Process(ctx context.Context, f frames.Frame, dir pro
 		return pp.processDataDownstream(ctx, f, emit)
 	default:
 		return nil
-	}
-}
-
-func isSyncFrame(f frames.Frame) bool {
-	switch f.(type) {
-	case *frames.StartFrame, *frames.EndFrame, *frames.CancelFrame:
-		return true
-	default:
-		return false
 	}
 }
 

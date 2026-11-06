@@ -113,7 +113,7 @@ func (c *Client) CreateSession(ctx context.Context, req CreateSessionRequest) (C
 	if err != nil {
 		return CreateSessionResponse{}, err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	raw, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return CreateSessionResponse{}, fmt.Errorf("lemonslice: %s: %s", resp.Status, strings.TrimSpace(string(raw)))
@@ -142,7 +142,7 @@ func EndSession(ctx context.Context, c *http.Client, controlURL, apiKey string) 
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		b, _ := io.ReadAll(resp.Body)
 		return fmt.Errorf("lemonslice end: %s: %s", resp.Status, strings.TrimSpace(string(b)))

@@ -78,7 +78,7 @@ func (t *Transport) Connect(ctx context.Context) error {
 		return err
 	}
 	if _, err = room.LocalParticipant.PublishTrack(lt, &lksdk.TrackPublicationOptions{Name: "agent"}); err != nil {
-		lt.Close()
+		_ = lt.Close()
 		room.Disconnect()
 		return err
 	}
@@ -102,7 +102,7 @@ func (t *Transport) Disconnect() {
 	t.mu.Unlock()
 	if lt != nil {
 		lt.ClearQueue()
-		lt.Close()
+		_ = lt.Close()
 	}
 	if room != nil {
 		room.Disconnect()

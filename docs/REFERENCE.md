@@ -1,6 +1,6 @@
 # llmpipe — Go reference
 
-**llmpipe** is a Go library that models a **voice/LLM pipeline**: ordered **processors** exchange typed **frames** downstream (and optionally upstream). It is suited for **speech → STT → LLM → TTS → audio out**, with hooks for **barge-in**, **session idle**, and **async service callbacks** that **re-enter** the pipeline after a named processor.
+**llmpipe** is a Go library that models a **voice/LLM pipeline**: ordered **processors** exchange typed **frames** downstream (and optionally upstream). It is suited for **speech → STT → LLM → TTS → audio out**, with hooks for **barge-in**, **session idle**, and **async service callbacks** that enqueue frames through a processor **Handle**.
 
 Module path: `github.com/rohitdas13595/llmpipe` (see `go.mod` in the module root). Repository: [github.com/rohitdas13595/llmpipe](https://github.com/rohitdas13595/llmpipe).
 
@@ -9,9 +9,9 @@ Module path: `github.com/rohitdas13595/llmpipe` (see `go.mod` in the module root
 ## Mental model
 
 1. You build a **linear pipeline** of `processor.Processor` values in the order frames should flow.
-2. A **PipelineTask** receives frames (usually at index `0`) and walks the chain: each processor may call `emit.Down` / `emit.Up` zero or more times.
-3. **Async work** (HTTP APIs, streaming LLM) does not block the whole chain forever: implementations call **`ReenterAfter(processorName, frame)`** on the task to push new frames **starting after** the processor that produced them.
-4. **Runner** blocks until the task’s context is cancelled (optional SIGINT wiring).
+2. A **PipelineTask** runs each processor on its own goroutine. `Process` is never re-entered. `emit.Down` / `emit.Up` enqueue on the neighbour; system frames are dequeued first, downstream data is bounded, upstream is not.
+3. **Async work** (HTTP APIs, streaming LLM) uses the **`processor.Handle`** passed to `Setup`: `PushFrameCtx` on the turn context, which is cancelled on interruption. `ReenterAfter` still enqueues but is deprecated.
+4. **`Run`** blocks until `EndFrame` reaches the sink (nil), `Cancel` (context.Canceled), or the parent context ends. **Runner** optionally wires SIGINT to `Cancel`.
 
 ```mermaid
 flowchart LR
@@ -105,19 +105,26 @@ Orchestrates frame flow and optional observers.
 
 - **`WithObservers(obs ...observe.FrameObserver)`** — e.g. logging, metrics.
 - **`WithIdleObserver(idle *observe.IdleFrameObserver)`** — session idle watchdog; also registered as an observer.
+- **`WithTaskOptions(TaskOptions)`** — data queue size (default 256), input-audio system cap (default 500), cancel timeout (default 20s), slow-`Process` log threshold (default 20ms), logger, `OnError`.
+- **`WithOnError(fn)`** — non-fatal `Process` errors once they reach the source.
 
 **Injection & control**
 
-- **`QueueFrames(ctx, []frames.Frame)`** — start processing at processor `0` downstream.
-- **`StartSession(ctx, *frames.StartFrame)`** — convenience: queues a single start frame.
-- **`Reenter(ctx, afterIdx int, f frames.Frame)`** — continue **downstream** from `afterIdx+1` (async callbacks).
-- **`ReenterAfter(ctx, processorName string, f frames.Frame)`** — resolve name → index, then `Reenter`.
+- **`QueueFrame` / `QueueFrames`** — enqueue at the pipeline head. Frames sent before `Run` are buffered. Downstream data blocks when that lane is full; a cancelled ctx drops the rest.
+- **`StartSession(ctx, *frames.StartFrame)`** — queues Start and waits until it reaches the sink.
+- **`StopWhenDone()`** — queues `EndFrame`. `Run` returns nil after the sink sees it and cleanup finishes.
+- **`Handle(name)`** — the processor's `processor.Handle`, valid after construction.
 - **`ProcessorIndex(name string) int`** — `-1` if unknown.
+- **`Reenter` / `ReenterAfter`** — deprecated. They only enqueue downstream of that processor (they do not call `Process` on the caller's goroutine). Removed in v0.4.
 
 **Lifecycle**
 
-- **`Run(ctx)`** — blocks until `ctx` is done; starts idle observer if configured; stores internal cancel.
-- **`Cancel()`** — idempotent cancel for the task context.
+- **`Run(ctx)`** — calls `Setup` in order, starts one goroutine per node, then blocks. Graceful `EndFrame` runs `Cleanup` in reverse and returns nil. `Cancel` pushes `CancelFrame`, waits up to `CancelTimeout`, then cancels the task context and returns `context.Canceled`.
+- **`Cancel()`** — idempotent.
+- **`Done()`** — closed when `Run` returns.
+- **`Running()`** — true once node loops are accepting frames directly.
+
+A `Process` error becomes an upstream `ErrorFrame` (not fatal). A panic becomes `FatalErrorFrame` and cancels the task. `ParallelPipeline` is expanded into fan-out and join nodes; the join dedupes a wave by `frames.Meta.ID`.
 
 **Observers**: before each `Process`, the task calls `OnFrame(FramePushed)` on every observer with frame, direction, processor name, and index.
 
@@ -192,25 +199,18 @@ type LLM interface { processor.Processor }
 type STT interface { processor.Processor }
 type TTS interface { processor.Processor }
 
+// Deprecated: pass nil. Services use processor.Handle from Setup.
 type ReenterFunc func(ctx context.Context, afterProcessorName string, f frames.Frame) error
 ```
 
-Async processors (streaming LLM, batch STT) take a **`ReenterFunc`** closure that must be wired to **`PipelineTask.ReenterAfter`** (or `Reenter`) so tokens/transcripts/errors rejoin the pipeline **after** that processor’s slot.
+Services embed `services.Slot`. `PipelineTask` calls `Setup` before frames flow. From any goroutine:
 
-Example pattern from `cmd/voicebot/main.go`:
+- **`PushFrame` / `PushFrameCtx`** enqueue downstream or upstream. Downstream data blocks when the neighbour's lane is full; `PushFrameCtx` returns when `ctx` is cancelled.
+- **`TurnContext`** is for one LLM/TTS turn. It is cancelled on `InterruptionFrame` or `Cancel`, then replaced.
+- **`Context`** is the processor context. STT uses it so an in-flight transcript survives barge-in.
+- **`QueueSelf`** runs `Process` again on this processor's goroutine (idle timer).
 
-```go
-var task *pipeline.PipelineTask
-reenter := func(ctx context.Context, name string, f frames.Frame) error {
-    if task == nil {
-        return nil
-    }
-    return task.ReenterAfter(ctx, name, f)
-}
-// pass reenter to NewSTT / NewLLM / NewTTS constructors that need it
-```
-
-Processor **`Name()`** must match the string passed to `Reenter` (e.g. `"stt"`, `"llm"`).
+`ReenterFunc` is still accepted by constructors and is used only when no Handle is installed (a processor invoked outside a task). Removed in v0.4.
 
 ---
 
@@ -383,15 +383,9 @@ ctx := aggregate.NewLLMContext("You are a helpful assistant.")
 bot := aggregate.NewBotState()
 
 var task *pipeline.PipelineTask
-reenter := func(c context.Context, name string, f frames.Frame) error {
-    if task == nil {
-        return nil
-    }
-    return task.ReenterAfter(c, name, f)
-}
 
-stt := deepgram.NewSTT("stt", os.Getenv("DEEPGRAM_API_KEY"), reenter, 16000, bot)
-llm := openai.NewLLM("llm", os.Getenv("OPENAI_API_KEY"), "gpt-4o-mini", ctx, reenter)
+stt := deepgram.NewSTT("stt", os.Getenv("DEEPGRAM_API_KEY"), nil, 16000, bot)
+llm := openai.NewLLM("llm", os.Getenv("OPENAI_API_KEY"), "gpt-4o-mini", ctx, nil)
 tts := elevenlabs.NewTTS("tts", os.Getenv("ELEVENLABS_API_KEY"), os.Getenv("ELEVENLABS_VOICE_ID"), bot, 16000)
 
 userAgg := aggregate.NewUserAggregator("user.agg", ctx, bot, interrupt.MinWords{N: 1})
@@ -444,13 +438,27 @@ Register it in the pipeline slice where it should run.
 
 ### 4. Async pattern
 
-Inside a goroutine after I/O completes:
+Implement `Setup` and push from the goroutine that did the I/O. Use the turn context so an interruption drops the result:
 
 ```go
-_ = reenter(ctx, "myproc", &frames.TextFrame{Text: result})
+func (p *MyProc) Setup(ctx context.Context, h processor.Handle) error {
+    p.h = h
+    return nil
+}
+
+// inside Process, on the processor goroutine:
+turn := p.h.TurnContext()
+go func() {
+    result, err := call(turn)
+    if err != nil {
+        _ = p.h.PushFrameCtx(turn, &frames.ErrorFrame{Err: err}, processor.Downstream)
+        return
+    }
+    _ = p.h.PushFrameCtx(turn, &frames.TextFrame{Text: result}, processor.Downstream)
+}()
 ```
 
-Ensure **`Name()`** of that processor is exactly `"myproc"` and **`reenter`** is bound to the same **`PipelineTask`** instance.
+`Process` itself should return quickly. Do not call another processor's `Process` directly.
 
 ### 5. Dependencies
 

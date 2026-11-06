@@ -28,10 +28,9 @@ type LLM struct {
 	Reenter    services.ReenterFunc
 	httpClient *http.Client
 
-	mu        sync.Mutex
-	cancel    context.CancelFunc
-	activeGen int64
-	runGen    int64
+	services.Slot
+	mu     sync.Mutex
+	cancel context.CancelFunc
 }
 
 func NewLLM(name, apiKey, model string, c *aggregate.LLMContext, re services.ReenterFunc) *LLM {
@@ -42,6 +41,10 @@ func NewLLM(name, apiKey, model string, c *aggregate.LLMContext, re services.Ree
 }
 
 func (l *LLM) Name() string { return l.name }
+
+func (l *LLM) push(ctx context.Context, f frames.Frame) error {
+	return services.PushDown(ctx, l.H(), l.Reenter, l.name, f)
+}
 
 func (l *LLM) Process(ctx context.Context, f frames.Frame, dir processor.Direction, emit processor.Emit) error {
 	switch f.(type) {
@@ -54,16 +57,15 @@ func (l *LLM) Process(ctx context.Context, f frames.Frame, dir processor.Directi
 			l.cancel()
 			l.cancel = nil
 		}
-		l.runGen++
 		l.mu.Unlock()
 		emit.Down(f)
 	case *frames.LLMRunFrame:
-		if l.Reenter == nil {
-			emit.Down(&frames.ErrorFrame{Err: fmt.Errorf("anthropic: Reenter not configured")})
+		if l.H() == nil && l.Reenter == nil {
+			emit.Down(&frames.ErrorFrame{Err: fmt.Errorf("anthropic: pipeline handle not configured")})
 			return nil
 		}
 		services.PipelineLog("llm", "%s: LLMRunFrame → Claude stream", l.name)
-		go l.runStream(context.Background())
+		go l.runStream(l.TurnContext())
 	case *frames.ErrorFrame:
 		emit.Down(f)
 	default:
@@ -80,25 +82,15 @@ type msgReq struct {
 	Stream    bool                `json:"stream"`
 }
 
-func (l *LLM) runStream(bg context.Context) {
+func (l *LLM) runStream(parent context.Context) {
 	l.mu.Lock()
-	l.runGen++
-	gen := l.runGen
 	if l.cancel != nil {
 		l.cancel()
 	}
-	ctx, cancel := context.WithCancel(bg)
+	ctx, cancel := context.WithCancel(parent)
 	l.cancel = cancel
-	l.activeGen = gen
 	l.mu.Unlock()
-	defer func() {
-		cancel()
-		l.mu.Lock()
-		if l.activeGen == gen {
-			l.cancel = nil
-		}
-		l.mu.Unlock()
-	}()
+	defer cancel()
 
 	msgs := l.Ctx.Snapshot()
 	var sys string
@@ -127,7 +119,7 @@ func (l *LLM) runStream(bg context.Context) {
 	})
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://api.anthropic.com/v1/messages", bytes.NewReader(body))
 	if err != nil {
-		_ = l.Reenter(ctx, l.name, &frames.ErrorFrame{Err: err})
+		_ = l.push(ctx, &frames.ErrorFrame{Err: err})
 		return
 	}
 	req.Header.Set("x-api-key", l.APIKey)
@@ -136,17 +128,17 @@ func (l *LLM) runStream(bg context.Context) {
 
 	resp, err := l.httpClient.Do(req)
 	if err != nil {
-		_ = l.Reenter(ctx, l.name, &frames.ErrorFrame{Err: err})
+		_ = l.push(ctx, &frames.ErrorFrame{Err: err})
 		return
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
 		b, _ := io.ReadAll(resp.Body)
-		_ = l.Reenter(ctx, l.name, &frames.ErrorFrame{Err: fmt.Errorf("anthropic: %s: %s", resp.Status, string(b))})
+		_ = l.push(ctx, &frames.ErrorFrame{Err: fmt.Errorf("anthropic: %s: %s", resp.Status, string(b))})
 		return
 	}
 
-	_ = l.Reenter(ctx, l.name, &frames.LLMFullResponseStartFrame{})
+	_ = l.push(ctx, &frames.LLMFullResponseStartFrame{})
 	sc := bufio.NewScanner(resp.Body)
 	for sc.Scan() {
 		if ctx.Err() != nil {
@@ -171,10 +163,10 @@ func (l *LLM) runStream(bg context.Context) {
 			continue
 		}
 		if ev.Type == "content_block_delta" && ev.Delta.Text != "" {
-			_ = l.Reenter(ctx, l.name, &frames.LLMTextFrame{Text: ev.Delta.Text})
+			_ = l.push(ctx, &frames.LLMTextFrame{Text: ev.Delta.Text})
 		}
 	}
-	_ = l.Reenter(ctx, l.name, &frames.LLMFullResponseEndFrame{})
+	_ = l.push(ctx, &frames.LLMFullResponseEndFrame{})
 	services.PipelineLog("llm", "%s: Claude stream finished", l.name)
 }
 

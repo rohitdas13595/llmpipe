@@ -12,6 +12,7 @@ import (
 type STT struct {
 	name    string
 	Reenter services.ReenterFunc
+	services.Slot
 }
 
 func NewSTT(name string, reenter services.ReenterFunc) *STT {

@@ -1,0 +1,62 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    name: test (go ${{ matrix.go }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        go: ["1.25.x", "stable"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go }}
+      - name: Install opus and soxr (livekit)
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libopus-dev libopusfile-dev libsoxr-dev
+      - name: vet
+        run: go vet ./...
+      - name: test
+        run: go test -race ./...
+      - name: stress
+        run: go test -race -count=20 -run 'Race|Stress' ./pipeline/
+      - name: benchmarks
+        run: go test -bench . -benchmem -run '^$$' ./pipeline/ | tee bench.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bench-go-${{ matrix.go }}
+          path: bench.txt
+
+  lint:
+    name: lint
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25.x"
+      - name: golangci-lint
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh | sh -s -- -b "$HOME/bin" v2.5.0
+          "$HOME/bin/golangci-lint" run ./...
+
+  nocgo:
+    name: nocgo
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25.x"
+      - name: build without cgo
+        run: |
+          CGO_ENABLED=0 go build -o /dev/null ./cmd/example-minimal-pipeline/ ./cmd/voicebot/
+          pkgs=$(go list ./... | grep -v '/transport/livekit' | grep -v '/cmd/voicebot-livekit')
+          CGO_ENABLED=0 go test -count=0 $pkgs

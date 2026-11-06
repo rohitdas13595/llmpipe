@@ -79,21 +79,13 @@ func main() {
 
 	var task *pipeline.PipelineTask
 	var endOnce sync.Once
-	endPipeline := func(reason string) {
+	cancelPipeline := func(reason string) {
 		endOnce.Do(func() {
-			log.Printf("end pipeline: %s", reason)
+			log.Printf("cancel pipeline: %s", reason)
 			if task != nil {
-				_ = task.QueueFrames(context.Background(), []frames.Frame{&frames.EndFrame{}})
 				task.Cancel()
 			}
 		})
-	}
-
-	reenter := func(ctx context.Context, name string, f frames.Frame) error {
-		if task == nil {
-			return nil
-		}
-		return task.ReenterAfter(ctx, name, f)
 	}
 
 	userAgg := aggregate.NewUserAggregator("user.agg", ctxLLM, bot, strategy)
@@ -114,7 +106,10 @@ func main() {
 	vadP := vad.NewProcessor("vad", vadAna)
 
 	userIdle := idle.NewUserProcessor("user.idle", time.Minute, func(retry int) bool {
-		endPipeline(fmt.Sprintf("user idle 1m — pipeline task only, demo/LiveKit process keeps running (retry=%d)", retry))
+		log.Printf("user idle 1m — stop when the pipeline drains (retry=%d)", retry)
+		if task != nil {
+			task.StopWhenDone()
+		}
 		return false
 	})
 
@@ -137,7 +132,7 @@ func main() {
 		procs = []processor.Processor{
 			userIdle,
 			tr.Input(),
-			providers.BuildGeminiLive(reenter, bot, providers.EnvOr("SYSTEM_PROMPT", "")),
+			providers.BuildGeminiLive(nil, bot, providers.EnvOr("SYSTEM_PROMPT", "")),
 			tr.Output(),
 		}
 	case "openai_realtime":
@@ -145,12 +140,12 @@ func main() {
 		procs = []processor.Processor{
 			userIdle,
 			tr.Input(),
-			providers.BuildOpenAIRealtime(reenter, bot, providers.EnvOr("SYSTEM_PROMPT", "")),
+			providers.BuildOpenAIRealtime(nil, bot, providers.EnvOr("SYSTEM_PROMPT", "")),
 			tr.Output(),
 		}
 	default:
-		stt := providers.BuildSTT(sttBackend, reenter, sampleRate, bot)
-		llm := providers.BuildLLM(llmBackend, reenter, ctxLLM)
+		stt := providers.BuildSTT(sttBackend, nil, sampleRate, bot)
+		llm := providers.BuildLLM(llmBackend, nil, ctxLLM)
 		tts := providers.BuildTTS(ttsBackend, bot, sampleRate)
 		procs = []processor.Processor{
 			userIdle,
@@ -177,7 +172,7 @@ func main() {
 		OnIdle: func() {
 			log.Println("pipeline idle timeout")
 			if task != nil {
-				task.Cancel()
+				task.StopWhenDone()
 			}
 		},
 	})
@@ -185,7 +180,7 @@ func main() {
 	task = pipeline.NewPipelineTask(p, pipeline.WithIdleObserver(idleObs))
 
 	tr.OnDisconnect = func() {
-		endPipeline("livekit remote participant left or room disconnected")
+		cancelPipeline("livekit remote participant left or room disconnected")
 	}
 
 	if err := tr.Connect(context.Background()); err != nil {
